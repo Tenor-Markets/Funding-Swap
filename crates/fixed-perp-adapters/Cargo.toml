@@ -1,0 +1,17 @@
+[package]
+name = "fixed-perp-adapters"
+version = "0.1.0"
+edition = "2021"
+publish = false
+rust-version = "1.89"
+
+[dependencies]
+fixed = { version = "=1.28.0", default-features = false }
+fixed-perp-math = { path = "../fixed-perp-math" }
+solana-pubkey = { version = "=4.3.0", default-features = false, features = ["curve25519"] }
+
+[dev-dependencies]
+base64 = "0.22"
+num-bigint = "0.4"
+proptest = "1"
+solana-pubkey = { version = "=4.3.0", default-features = false, features = ["curve25519", "std"] }
