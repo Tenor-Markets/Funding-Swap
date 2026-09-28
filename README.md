@@ -6,7 +6,8 @@ The workspace is intentionally narrow:
 
 - `crates/fixed-perp-math` holds the checked fixed-point primitives.
 - `programs/fixed-perp` holds the production Anchor program scaffold.
-- `guide/guide.md` is preserved byte-for-byte from the source guide.
+- `guide/guide.md` is reconciled with the implementation; its `DONT TOUCH`
+  suffix remains byte-for-byte protected.
 
 ## Pinned environment
 

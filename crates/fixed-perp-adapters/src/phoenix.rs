@@ -1,6 +1,5 @@
 use core::convert::TryFrom;
 
-use fixed::types::I64F64;
 use fixed_perp_math::rate::RateDelta;
 use solana_pubkey::Pubkey;
 
@@ -29,6 +28,7 @@ pub const MAX_NUMBER_OF_PERP_ASSETS: u32 = 1_024;
 pub const PERP_ASSET_MAP_HEADER_LEN: usize = 48;
 pub const PERP_ASSET_ENTRY_STRIDE: usize = 1_584;
 pub const PERP_ASSET_METADATA_LEN: usize = 1_568;
+pub const PHOENIX_QUOTE_LOT_DECIMALS: u8 = 6;
 
 const GLOBAL_CANONICAL_MINT_OFFSET: usize = 296;
 const GLOBAL_ASSET_MAP_OFFSET: usize = 360;
@@ -67,11 +67,11 @@ pub enum PhoenixLayout {
 ///
 /// This is trusted configuration, not serialized instruction data and not a
 /// caller-controlled account-selection mechanism. The pure adapter accepts it
-/// by reference so tests and an eventual protocol-owned market configuration
-/// can select any supported Rise market without hard-coding SOL. The eventual
-/// instruction must load this configuration from protocol state (and reject or
-/// ignore a caller-supplied replacement), then bind the supplied accounts to
-/// the stored global/map/slot/symbol/market metadata.
+/// by reference so tests and protocol-owned market configuration can select
+/// any supported Rise market without hard-coding SOL. The instruction-layer
+/// refresh path must load this configuration from protocol state (and reject
+/// or ignore a caller-supplied replacement), then bind the supplied accounts
+/// to the stored global/map/slot/symbol/market metadata.
 ///
 /// Consistently changing all market-specific fields to another valid source is
 /// a governance reconfiguration. Changing only the source accounts is account
@@ -134,9 +134,10 @@ pub struct PhoenixRateObservation {
 /// Validate the fixed-offset, source-backed Phoenix accounts for one market.
 ///
 /// `config` is trusted protocol-owned market configuration; account bytes and
-/// the clock context are the untrusted inputs. An eventual instruction should
-/// load `config` from protocol state and source `PhoenixSourceContext` from the
-/// Solana Clock sysvar rather than instruction data.
+/// the clock context are the untrusted inputs. The instruction-layer refresh
+/// path must load `config` from protocol state and source
+/// `PhoenixSourceContext` from the Solana Clock sysvar rather than instruction
+/// data.
 pub fn validate_source(
     config: &PhoenixSourceConfig,
     context: &PhoenixSourceContext,
@@ -315,12 +316,50 @@ pub fn validate_source(
     })
 }
 
-pub fn normalize_source_delta(native_delta: i128) -> Result<RateDelta, AdapterError> {
-    // Phoenix cumulative funding is already price weighted. Retain the native
-    // delta intact; mark/tick inputs remain boundary validation only.
-    let native =
-        I64F64::checked_from_num(native_delta).ok_or(AdapterError::NormalizationOverflow)?;
-    Ok(RateDelta::from_i64f64(native))
+pub fn normalize_source_delta(
+    native_delta: i128,
+    base_lot_decimals: u8,
+) -> Result<RateDelta, AdapterError> {
+    // Rise stores cumulative funding in signed quote lots per base lot. Its
+    // quote lots have six decimals, while base_lot_decimals is the number of
+    // base lots per whole underlying unit. Preserve the venue's price-weighted
+    // economics by converting only those lot units.
+    let mut native = native_delta.unsigned_abs();
+    let mut q64_scale = 1u128 << 64;
+    let mut base_scale = 10u128
+        .checked_pow(u32::from(base_lot_decimals))
+        .ok_or(AdapterError::NormalizationOverflow)?;
+    let mut denominator = 10u128.pow(u32::from(PHOENIX_QUOTE_LOT_DECIMALS));
+    for numerator in [&mut native, &mut q64_scale, &mut base_scale] {
+        let divisor = gcd(*numerator, denominator);
+        *numerator /= divisor;
+        denominator /= divisor;
+    }
+    let magnitude = native
+        .checked_mul(q64_scale)
+        .and_then(|value| value.checked_mul(base_scale))
+        .and_then(|value| value.checked_div(denominator))
+        .ok_or(AdapterError::NormalizationOverflow)?;
+    let magnitude = i128::try_from(magnitude).map_err(|_| AdapterError::NormalizationOverflow)?;
+    let raw_bits = if native_delta < 0 {
+        magnitude
+            .checked_neg()
+            .ok_or(AdapterError::NormalizationOverflow)?
+    } else {
+        magnitude
+    };
+    Ok(RateDelta::from_i64f64(fixed::types::I64F64::from_bits(
+        raw_bits,
+    )))
+}
+
+fn gcd(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 pub fn observe(
@@ -337,7 +376,7 @@ pub fn observe(
     if !native_delta_within_bound(source_native_delta, config.max_abs_native_delta) {
         return Err(AdapterError::SourceDeltaTooLarge);
     }
-    let rate_delta = normalize_source_delta(source_native_delta)?;
+    let rate_delta = normalize_source_delta(source_native_delta, config.base_lot_decimals)?;
     Ok(PhoenixRateObservation {
         source_checkpoint: source.cumulative_funding_rate,
         source_native_delta,

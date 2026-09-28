@@ -23,8 +23,8 @@ tag_type!(SubaccountStatus);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
 #[cfg_attr(feature = "idl-build", derive(AnchorSerialize, AnchorDeserialize))]
 pub struct OrderRiskAggregate {
-    // Cached remaining-order risk. It is rebuilt from canonical book nodes when
-    // the market's cache nonce changes, rather than being a source of truth.
+    // Cached remaining-order risk. It is rebuilt on demand from canonical book
+    // nodes when the market's cache nonce changes, rather than being a source of truth.
     pub sum_long_order_size: u64,
     pub sum_long_order_pm: FixedPoint,
     pub sum_short_order_size: u64,
@@ -32,6 +32,14 @@ pub struct OrderRiskAggregate {
     pub pm_cache_nonce_snapshot: u32,
     // Completes the fixed 56-byte cache record without implicit ABI padding.
     pub _pad_0: [u8; 4],
+}
+
+/// Copyable market unit scales used when converting order risk into settlement atoms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrderRiskScale {
+    pub(crate) underlying_decimals: u8,
+    pub(crate) settlement_decimals: u8,
+    pub(crate) tick_scale: u8,
 }
 
 #[repr(C)]
@@ -99,6 +107,14 @@ pub struct Subaccount {
 impl Subaccount {
     pub const DATA_LEN: usize = core::mem::size_of::<Self>();
     pub const SPACE: usize = 8 + Self::DATA_LEN;
+
+    pub fn is_authority(&self, authority: Pubkey) -> bool {
+        self.authority == authority
+    }
+
+    pub fn is_same_group_id(&self, group_id: u16) -> bool {
+        self.group_id == group_id
+    }
 }
 
 pub const SUBACCOUNT_ACTIVE: u8 = 1;
@@ -120,6 +136,18 @@ impl Subaccount {
         self.group_id = group_id;
         self.status = super::SubaccountStatus(SUBACCOUNT_ACTIVE);
         self.bump = bump;
+        self._pad_0 = [0; 10];
+        // Initializers own the complete fixed layout.  Do not rely on the
+        // caller having supplied a zeroed backing account for any collection
+        // or reserved bytes.
+        self.collateral_balance_atoms = 0;
+        self.delegate = Pubkey::default();
+        self.markets = [MarketSlot::zeroed(); MAX_MARKETS];
+        self.order_refs = [OrderRef::zeroed(); MAX_ORDERS];
+        self.order_ref_count = 0;
+        self._pad_1 = [0; 7];
+        self.reserved = [0; SUBACCOUNT_RESERVED];
+        self._pad_2 = [0; 8];
         Ok(())
     }
 
@@ -142,8 +170,8 @@ impl Subaccount {
     }
 
     /// Returns this market's slot, allocating an empty slot with current index snapshots.
-    pub fn ensure_market(&mut self, market: &MarketState) -> StateResult<usize> {
-        if let Ok(market_slot_index) = self.lookup_market(market.config.market_id) {
+    pub fn ensure_market(&mut self, market: &mut MarketState) -> StateResult<usize> {
+        if let Some(market_slot_index) = self.lookup_market(market.config.market_id) {
             return Ok(market_slot_index);
         }
         let market_slot_index = self
@@ -151,6 +179,7 @@ impl Subaccount {
             .iter()
             .position(|market_slot| market_slot.market_id == 0)
             .ok_or(StateError::CapacityExhausted)?;
+        market.add_subaccount()?;
         self.markets[market_slot_index] = MarketSlot {
             market_id: market.config.market_id,
             floating_index_snapshot: market.floating_index,
@@ -160,37 +189,83 @@ impl Subaccount {
         Ok(market_slot_index)
     }
 
-    /// Zeros every market slot with no position, settlement value, order risk, or reference.
-    pub fn close_empty_markets(&mut self) -> usize {
-        let mut closed = 0;
-        for market_slot_index in 0..MAX_MARKETS {
-            let market_slot = &self.markets[market_slot_index];
-            let has_reference = self
-                .iter_order_refs()
-                .iter()
-                .any(|reference| usize::from(reference.slot_index) == market_slot_index);
-            if market_slot.market_id != 0
-                && market_slot.position_size == 0
-                && market_slot.settlement_balance_atoms == 0
-                && market_slot.order_risk.sum_long_order_size == 0
-                && market_slot.order_risk.sum_short_order_size == 0
-                && !has_reference
-            {
-                self.markets[market_slot_index] = MarketSlot::zeroed();
-                closed += 1;
-            }
+    /// Releases one occupied market slot and updates the market's subaccount count.
+    /// It assumes the index provided is valid.
+    pub(crate) fn close_market(
+        &mut self,
+        market_slot_index: usize,
+        market: &mut MarketState,
+    ) -> StateResult<()> {
+        let market_slot = self
+            .markets
+            .get(market_slot_index)
+            .ok_or(StateError::InvalidReference)?;
+        if market_slot.market_id != 0 {
+            market.remove_subaccount()?;
+            self.markets[market_slot_index] = MarketSlot::zeroed();
         }
-        closed
+        Ok(())
     }
 
-    /// Returns whether this subaccount has no collateral, markets, or orders.
-    pub fn is_empty(&self) -> bool {
-        self.collateral_balance_atoms == 0
-            && self.order_ref_count == 0
-            && self
-                .markets
-                .iter()
-                .all(|market| *market == MarketSlot::zeroed())
+    /// Converts a market slot's signed settlement balance into collateral.
+    /// The slot remains open and its position/order state is unchanged.
+    pub(crate) fn settle_market_into_collateral(
+        &mut self,
+        market_slot_index: usize,
+        market: &MarketState,
+        ratio: super::SettlementRatio,
+    ) -> StateResult<()> {
+        let slot = self
+            .markets
+            .get(market_slot_index)
+            .ok_or(StateError::InvalidReference)?;
+        if slot.market_id != market.config.market_id || market.subaccount_count == 0 {
+            return Err(StateError::InvalidMarket);
+        }
+        if slot.settlement_balance_atoms == 0 {
+            return Ok(());
+        }
+        let collateral = ratio.apply(slot.settlement_balance_atoms)?;
+        self.collateral_balance_atoms = self
+            .collateral_balance_atoms
+            .checked_add(collateral)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        self.markets[market_slot_index].settlement_balance_atoms = 0;
+        Ok(())
+    }
+
+    /// Converts a finalized market's signed settlement balance into this
+    /// subaccount's signed collateral balance, then releases the slot.  The
+    /// market ratio is applied exactly once; a missing ratio keeps the slot
+    /// open so callers cannot close around an unsettled obligation.  A
+    /// non-zero position is the expired contract itself and is retired here
+    /// after all pending orders have already been cancelled by the caller.
+    pub fn settle_and_close_market(
+        &mut self,
+        market_slot_index: usize,
+        market: &mut MarketState,
+    ) -> StateResult<()> {
+        if !market.is_matured() {
+            return Err(StateError::InvalidStatus);
+        }
+
+        let ratio = market
+            .frozen_settlement_ratio()
+            .ok_or(StateError::InvalidStatus)?;
+
+        let slot = self
+            .markets
+            .get(market_slot_index)
+            .ok_or(StateError::InvalidReference)?;
+        if slot.market_id != market.config.market_id || market.subaccount_count == 0 {
+            return Err(StateError::InvalidReference);
+        }
+        if !slot.order_risk.is_empty() {
+            return Err(StateError::Conflict);
+        }
+        self.settle_market_into_collateral(market_slot_index, market, ratio)?;
+        self.markets[market_slot_index].position_size = 0;
+        self.close_market(market_slot_index, market)
     }
 
     /// Appends a unique reference after the market transition checks capacity and ownership.
@@ -216,20 +291,26 @@ impl Subaccount {
     }
 
     /// Finds an active slot for the requested market identifier.
-    pub(crate) fn lookup_market(&self, market_id: u32) -> StateResult<usize> {
+    pub(crate) fn lookup_market(&self, market_id: u32) -> Option<usize> {
         self.markets
             .iter()
             .position(|slot| slot.market_id == market_id)
-            .ok_or(StateError::NotFound)
     }
 }
 
 impl OrderRiskAggregate {
+    /// Returns whether both sides have no remaining order size.
+    /// Floating-point PM values and the nonce do not determine live order risk.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sum_long_order_size == 0 && self.sum_short_order_size == 0
+    }
+
     /// Computes one side's Q64.64 potential-margin contribution from bounded inputs.
     pub(crate) fn pm_contribution(
         size: u64,
         rate: super::FixedPoint,
         rate_floor: super::FixedPoint,
+        unit_scale: OrderRiskScale,
     ) -> StateResult<i128> {
         let rate_raw = rate
             .to_raw_bits()
@@ -239,11 +320,28 @@ impl OrderRiskAggregate {
         if floor_raw < 0 {
             return Err(StateError::InvalidConfiguration);
         }
-        // `size` is integral atoms, so multiplying the Q64.64 raw value keeps
-        // the result in Q64.64; no fixed-point rescale is required.
         let effective_raw = rate_raw.max(floor_raw);
-        i128::from(size)
-            .checked_mul(effective_raw)
+        let scale = |decimals: u8| -> StateResult<fixed::types::I64F64> {
+            let mut value = fixed::types::I64F64::ONE;
+            for _ in 0..decimals {
+                value = value
+                    .checked_mul(fixed::types::I64F64::from_num(10))
+                    .ok_or(StateError::ArithmeticOverflow)?;
+            }
+            Ok(value)
+        };
+        let size =
+            fixed::types::I64F64::checked_from_num(size).ok_or(StateError::ArithmeticOverflow)?;
+        let effective_rate = fixed::types::I64F64::from_bits(effective_raw);
+        let settlement_scale = scale(unit_scale.settlement_decimals)?;
+        let underlying_scale = scale(unit_scale.underlying_decimals)?;
+        let tick_scale = scale(unit_scale.tick_scale)?;
+        effective_rate
+            .checked_mul(size)
+            .and_then(|value| value.checked_mul(settlement_scale))
+            .and_then(|value| value.checked_div(underlying_scale))
+            .and_then(|value| value.checked_div(tick_scale))
+            .map(|value| value.to_bits())
             .ok_or(StateError::ArithmeticOverflow)
     }
 
@@ -254,8 +352,9 @@ impl OrderRiskAggregate {
         size: u64,
         rate: super::FixedPoint,
         rate_floor: super::FixedPoint,
+        unit_scale: OrderRiskScale,
     ) -> StateResult<()> {
-        let contribution = Self::pm_contribution(size, rate, rate_floor)?;
+        let contribution = Self::pm_contribution(size, rate, rate_floor, unit_scale)?;
         if side == Side::Long {
             let next_size = self
                 .sum_long_order_size
@@ -291,8 +390,9 @@ impl OrderRiskAggregate {
         size: u64,
         rate: super::FixedPoint,
         rate_floor: super::FixedPoint,
+        unit_scale: OrderRiskScale,
     ) -> StateResult<()> {
-        let contribution = Self::pm_contribution(size, rate, rate_floor)?;
+        let contribution = Self::pm_contribution(size, rate, rate_floor, unit_scale)?;
         let (current_size, current_pm) = if side == Side::Long {
             (
                 self.sum_long_order_size,

@@ -95,7 +95,14 @@ pub struct ValidatedJupiterSource {
 pub struct JupiterRateObservation {
     pub source_checkpoint: u128,
     pub source_delta: u128,
+    pub source_last_update_timestamp: i64,
     pub rate_delta: RateDelta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JupiterSeedObservation {
+    pub source_checkpoint: u128,
+    pub source_last_update_timestamp: i64,
 }
 
 pub fn validate_source(
@@ -145,7 +152,31 @@ pub fn observe(
     Ok(JupiterRateObservation {
         source_checkpoint,
         source_delta,
+        source_last_update_timestamp: source.custody.funding_rate_state.last_update,
         rate_delta: normalize_source_delta(source_delta)?,
+    })
+}
+
+/// Authenticates a fresh source and returns its current cumulative checkpoint
+/// without imposing a delta bound against pre-market history.
+pub fn seed_observation(
+    config: &JupiterSourceConfig,
+    account: &JupiterAccount<'_>,
+    protocol_now: i64,
+) -> Result<JupiterSeedObservation, AdapterError> {
+    let source = validate_source(config, account)?;
+    validate_observation_timestamps(
+        ObservationContext {
+            previous_source_checkpoint: 0,
+            previous_protocol_checkpoint_at: protocol_now,
+            protocol_now,
+        },
+        source.custody.funding_rate_state.last_update,
+        config.limits,
+    )?;
+    Ok(JupiterSeedObservation {
+        source_checkpoint: effective_checkpoint(source.custody, protocol_now)?,
+        source_last_update_timestamp: source.custody.funding_rate_state.last_update,
     })
 }
 

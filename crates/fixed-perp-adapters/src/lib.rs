@@ -20,7 +20,6 @@ pub struct AccountView<'a> {
 pub struct ObservationLimits {
     pub max_source_delta: u128,
     pub max_source_age_seconds: u64,
-    pub max_checkpoint_age_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,34 +42,19 @@ pub(crate) fn validate_observation_timestamps(
     {
         return Err(AdapterError::InvalidProtocolCheckpointTimestamp);
     }
-
-    let source_age = if context.protocol_now <= source_last_update {
-        0
-    } else {
-        if source_last_update < 0 {
-            return Err(AdapterError::InvalidSourceAnchor);
-        }
-        u64::try_from(
-            context
-                .protocol_now
-                .checked_sub(source_last_update)
-                .ok_or(AdapterError::ArithmeticOverflow)?,
-        )
-        .map_err(|_| AdapterError::ArithmeticOverflow)?
-    };
-    if source_age > limits.max_source_age_seconds {
-        return Err(AdapterError::SourceTooOld);
+    if source_last_update < 0 || source_last_update > context.protocol_now {
+        return Err(AdapterError::InvalidSourceAnchor);
     }
 
-    let checkpoint_age = u64::try_from(
+    let source_age = u64::try_from(
         context
             .protocol_now
-            .checked_sub(context.previous_protocol_checkpoint_at)
+            .checked_sub(source_last_update)
             .ok_or(AdapterError::ArithmeticOverflow)?,
     )
     .map_err(|_| AdapterError::ArithmeticOverflow)?;
-    if checkpoint_age > limits.max_checkpoint_age_seconds {
-        return Err(AdapterError::ProtocolCheckpointTooOld);
+    if source_age > limits.max_source_age_seconds {
+        return Err(AdapterError::SourceTooOld);
     }
 
     Ok(())

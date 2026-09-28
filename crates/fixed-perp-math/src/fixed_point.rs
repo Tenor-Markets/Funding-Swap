@@ -89,7 +89,7 @@ impl FixedPoint {
     /// valued conservatively high. `decimals` must satisfy `10^decimals`
     /// within the exact integer range.
     pub fn scaled_value_atoms(self, atoms: i128, decimals: u8) -> Result<i128, MathError> {
-        let scale = pow10(decimals).ok_or(MathError::Overflow)? as u128;
+        let scale = pow10(decimals).ok_or(MathError::Overflow)?;
         let mut numerator = self.to_raw_bits().unsigned_abs();
         let mut amount = atoms.unsigned_abs();
         let mut denominator = (1u128 << I64F64::FRAC_NBITS)
@@ -120,11 +120,11 @@ impl FixedPoint {
 }
 
 /// Returns `10^decimals` when it fits the exact integer range, else `None`.
-fn pow10(decimals: u8) -> Option<i128> {
+fn pow10(decimals: u8) -> Option<u128> {
     if decimals > 18 {
         return None;
     }
-    let mut value: i128 = 1;
+    let mut value = 1u128;
     for _ in 0..decimals {
         value = value.checked_mul(10)?;
     }

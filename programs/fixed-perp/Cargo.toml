@@ -25,8 +25,10 @@ anchor-lang = "=1.0.2"
 anchor-spl = { version = "=1.0.2", features = ["token"] }
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 fixed = { version = "=1.28.0", default-features = false }
+fixed-perp-error = { path = "../../crates/fixed-perp-error" }
 fixed-perp-adapters = { path = "../../crates/fixed-perp-adapters" }
 fixed-perp-math = { path = "../../crates/fixed-perp-math" }
+pyth-solana-receiver-sdk = "2.0.0"
 
 [dev-dependencies]
 proptest = "1"

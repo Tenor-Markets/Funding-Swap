@@ -159,16 +159,16 @@ impl Rate {
         if time_to_maturity < 0 || seconds_per_year <= 0 {
             return Err(MathError::InvalidDuration);
         }
-        let payment = scaled_payment(
-            self.0.to_raw_bits(),
+        let payment = scaled_payment(ScaledPaymentParams {
+            raw_value_q64_bits: self.0.to_raw_bits(),
             signed_underlying_atoms,
-            Some(time_to_maturity),
+            time_to_maturity_seconds: Some(time_to_maturity),
             seconds_per_year,
             underlying_decimals,
             settlement_decimals,
             tick_scale,
-            Rounding::Floor,
-        )?;
+            rounding: Rounding::Floor,
+        })?;
         payment.checked_neg().ok_or(MathError::Overflow)
     }
 }
@@ -195,16 +195,16 @@ impl RateDelta {
         settlement_decimals: u8,
         tick_scale: u8,
     ) -> Result<i128, MathError> {
-        scaled_payment(
-            self.0.to_raw_bits(),
+        scaled_payment(ScaledPaymentParams {
+            raw_value_q64_bits: self.0.to_raw_bits(),
             signed_underlying_atoms,
-            None,
-            1,
+            time_to_maturity_seconds: None,
+            seconds_per_year: 1,
             underlying_decimals,
             settlement_decimals,
             tick_scale,
-            Rounding::Floor,
-        )
+            rounding: Rounding::Floor,
+        })
     }
 }
 
@@ -230,16 +230,16 @@ impl FeeRate {
         tick_scale: u8,
     ) -> Result<u128, MathError> {
         let atoms = i128::try_from(underlying_atoms).map_err(|_| MathError::Overflow)?;
-        let value = scaled_payment(
-            self.0.to_raw_bits(),
-            atoms,
-            None,
-            1,
+        let value = scaled_payment(ScaledPaymentParams {
+            raw_value_q64_bits: self.0.to_raw_bits(),
+            signed_underlying_atoms: atoms,
+            time_to_maturity_seconds: None,
+            seconds_per_year: 1,
             underlying_decimals,
             settlement_decimals,
             tick_scale,
-            Rounding::Ceil,
-        )?;
+            rounding: Rounding::Ceil,
+        })?;
         u128::try_from(value).map_err(|_| MathError::Overflow)
     }
 }
@@ -250,11 +250,23 @@ enum Rounding {
     Ceil,
 }
 
-fn pow10(decimals: u8) -> Result<i128, MathError> {
+#[derive(Clone, Copy)]
+struct ScaledPaymentParams {
+    raw_value_q64_bits: i128,
+    signed_underlying_atoms: i128,
+    time_to_maturity_seconds: Option<i64>,
+    seconds_per_year: i64,
+    underlying_decimals: u8,
+    settlement_decimals: u8,
+    tick_scale: u8,
+    rounding: Rounding,
+}
+
+fn pow10(decimals: u8) -> Result<u128, MathError> {
     if decimals > MAX_DECIMALS {
         return Err(MathError::Overflow);
     }
-    let mut value = 1i128;
+    let mut value = 1u128;
     for _ in 0..decimals {
         value = value.checked_mul(10).ok_or(MathError::Overflow)?;
     }
@@ -296,33 +308,24 @@ fn signed_abs(value: i128) -> u128 {
     value.unsigned_abs()
 }
 
-fn scaled_payment(
-    raw_bits: i128,
-    signed_underlying_atoms: i128,
-    time_to_maturity: Option<i64>,
-    seconds_per_year: i64,
-    underlying_decimals: u8,
-    settlement_decimals: u8,
-    tick_scale: u8,
-    rounding: Rounding,
-) -> Result<i128, MathError> {
-    if seconds_per_year <= 0 {
+fn scaled_payment(params: ScaledPaymentParams) -> Result<i128, MathError> {
+    if params.seconds_per_year <= 0 {
         return Err(MathError::InvalidDuration);
     }
-    let settlement_scale = pow10(settlement_decimals)? as u128;
-    let underlying_scale = pow10(underlying_decimals)? as u128;
-    let tick_scale_factor = pow10(tick_scale)? as u128;
-    let mut numerators = vec![
-        signed_abs(raw_bits),
-        signed_abs(signed_underlying_atoms),
+    let settlement_scale = pow10(params.settlement_decimals)?;
+    let underlying_scale = pow10(params.underlying_decimals)?;
+    let tick_scale_factor = pow10(params.tick_scale)?;
+    let mut numerators = [
+        signed_abs(params.raw_value_q64_bits),
+        signed_abs(params.signed_underlying_atoms),
         settlement_scale,
+        1,
     ];
-    if let Some(time) = time_to_maturity {
-        numerators.push(u128::try_from(time).map_err(|_| MathError::InvalidDuration)?);
-    }
-    let mut denominators = vec![1u128 << 64, underlying_scale, tick_scale_factor];
-    if time_to_maturity.is_some() {
-        denominators.push(u128::try_from(seconds_per_year).map_err(|_| MathError::Overflow)?);
+    let mut denominators = [1u128 << 64, underlying_scale, tick_scale_factor, 1];
+    if let Some(time) = params.time_to_maturity_seconds {
+        numerators[3] = u128::try_from(time).map_err(|_| MathError::InvalidDuration)?;
+        denominators[3] =
+            u128::try_from(params.seconds_per_year).map_err(|_| MathError::Overflow)?;
     }
     reduce_factors(&mut numerators, &mut denominators);
     let numerator = checked_product(&numerators)?;
@@ -330,10 +333,10 @@ fn scaled_payment(
     if denominator == 0 {
         return Err(MathError::Overflow);
     }
-    let negative = (raw_bits < 0) ^ (signed_underlying_atoms < 0);
+    let negative = (params.raw_value_q64_bits < 0) ^ (params.signed_underlying_atoms < 0);
     let quotient = numerator / denominator;
     let remainder = numerator % denominator;
-    let rounded = match rounding {
+    let rounded = match params.rounding {
         Rounding::Floor if negative && remainder != 0 => {
             quotient.checked_add(1).ok_or(MathError::Overflow)?
         }

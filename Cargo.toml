@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/fixed-perp-error",
     "crates/fixed-perp-adapters",
     "crates/fixed-perp-math",
     "programs/fixed-perp",

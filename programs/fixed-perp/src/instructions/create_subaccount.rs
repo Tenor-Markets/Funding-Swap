@@ -1,9 +1,10 @@
+// CHECKED
 use anchor_lang::prelude::*;
 
-use crate::state::{MarginGroup, Subaccount};
+use crate::state::{GlobalGovernanceConfig, MarginGroup, StateError, Subaccount};
 
 #[derive(Accounts)]
-#[instruction(subaccount_id: u16, group_id: u16)]
+#[instruction(subaccount_id: u16)]
 pub struct CreateSubaccount<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -17,11 +18,18 @@ pub struct CreateSubaccount<'info> {
     pub subaccount: AccountLoader<'info, Subaccount>,
     #[account(
         mut,
-        seeds = [b"margin_group", &group_id.to_le_bytes()],
-        bump = margin_group.load()?.bump,
-        constraint = margin_group.load()?.group_id == group_id
+        constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
+    pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
+    /// CHECK: Its key is constrained to the destination stored in governance.
+    #[account(
+        mut,
+        constraint = global_governance
+            .load()?
+            .is_creation_fee_destination(creation_fee_destination.key()) @ StateError::InvalidKey
+    )]
+    pub creation_fee_destination: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -29,9 +37,29 @@ pub struct CreateSubaccount<'info> {
 pub fn handle_create_subaccount(
     context: Context<CreateSubaccount>,
     subaccount_id: u16,
-    group_id: u16,
 ) -> Result<()> {
+    let creation_fee_lamports = context
+        .accounts
+        .global_governance
+        .load()?
+        .subaccount_creation_fee_lamports;
+
+    if creation_fee_lamports != 0 {
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                anchor_lang::system_program::ID,
+                anchor_lang::system_program::Transfer {
+                    from: context.accounts.authority.to_account_info(),
+                    to: context.accounts.creation_fee_destination.to_account_info(),
+                },
+            ),
+            creation_fee_lamports,
+        )?;
+    }
+
+    let group_id = context.accounts.margin_group.load()?.group_id;
     let bump = context.bumps.subaccount;
+
     context
         .accounts
         .subaccount
@@ -43,5 +71,6 @@ pub fn handle_create_subaccount(
             group_id,
         )?;
     context.accounts.margin_group.load_mut()?.add_subaccount()?;
+
     Ok(())
 }
