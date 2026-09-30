@@ -82,11 +82,37 @@ pub(crate) fn settlement_ratio(
     collateral: &AssetObservation<'_>,
     settlement: &AssetObservation<'_>,
 ) -> Result<SettlementRatio> {
+    // One asset account cannot be borrowed twice. Identical keys are a unit
+    // ratio and do not need either guard.
+    if collateral.loader.key() == settlement.loader.key() {
+        return Ok(SettlementRatio::new(1, 1)?);
+    }
+
     let collateral_guard = collateral.loader.load()?;
 
     let settlement_guard = settlement.loader.load()?;
 
     settlement_ratio_with_guards(collateral, settlement, &collateral_guard, &settlement_guard)
+}
+
+/// Current collateral-per-settlement price for a live settlement balance.
+///
+/// The account order is the collateral `AssetState` and its optional Pyth
+/// update, then the settlement `AssetState` and its optional Pyth update.
+/// Market accounts are not part of this pair. [`read_observation_set`] remains
+/// the health-observation structure used by valuation.
+pub(crate) fn read_current_settlement_ratio<'info>(
+    accounts: &'info [AccountInfo<'info>],
+    collateral_key: Pubkey,
+    settlement_key: Pubkey,
+    now: i64,
+) -> Result<SettlementRatio> {
+    let (collateral, remaining) = read_asset_observation(accounts, collateral_key, now)?;
+    let (settlement, rest) = read_asset_observation(remaining, settlement_key, now)?;
+    if !rest.is_empty() {
+        return Err(error!(StateError::InvalidRemainingAccounts));
+    }
+    settlement_ratio(&collateral, &settlement)
 }
 
 /// Computes the ratio from guards already held by the caller. Identical asset
