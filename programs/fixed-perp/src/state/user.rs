@@ -260,10 +260,34 @@ impl Subaccount {
         if slot.market_id != market.config.market_id || market.subaccount_count == 0 {
             return Err(StateError::InvalidReference);
         }
-        if !slot.order_risk.is_empty() {
+        if !slot.order_risk.is_empty()
+            || self
+                .iter_order_refs()
+                .iter()
+                .any(|reference| usize::from(reference.slot_index) == market_slot_index)
+        {
             return Err(StateError::Conflict);
         }
+        // The position is already in materialized open interest. Retiring it
+        // removes that contribution. Pending maker reserve stays until the
+        // maker node is materialized, which also removes its order reference.
+        let position_abs = u128::from(slot.position_size.unsigned_abs());
+        let next_open_interest = market
+            .materialized_gross_open_interest
+            .checked_sub(position_abs)
+            .ok_or(StateError::Conflict)?;
+        let collateral_delta = ratio.apply(slot.settlement_balance_atoms)?;
+        if self
+            .collateral_balance_atoms
+            .checked_add(collateral_delta)
+            .is_none()
+        {
+            return Err(StateError::ArithmeticOverflow);
+        }
+        // Settlement is idempotent once the balance is zero, so a later close
+        // failure can be retried without subtracting open interest twice.
         self.settle_market_into_collateral(market_slot_index, market, ratio)?;
+        market.materialized_gross_open_interest = next_open_interest;
         self.markets[market_slot_index].position_size = 0;
         self.close_market(market_slot_index, market)
     }

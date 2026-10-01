@@ -1663,7 +1663,7 @@ impl MarketState {
             return Err(StateError::Conflict);
         }
 
-        // We don't flip side from the modify path: https://pochettes.pulsradio.com/drake%20-%20hotline%20bling.jpg        
+        // We don't flip side from the modify path: https://pochettes.pulsradio.com/drake%20-%20hotline%20bling.jpg
         if new_size.signum() != remaining_size.signum() {
             return Err(StateError::InvalidConfiguration);
         }
@@ -2336,7 +2336,11 @@ impl MarketState {
         old_position_abs: u128,
         new_position_abs: u128,
     ) -> StateResult<()> {
-        if new_position_abs != 0
+        // An executed fill is settled even when the resulting position is
+        // outside the bounds that govern new orders. Those bounds still apply
+        // before maturity.
+        if !self.is_matured()
+            && new_position_abs != 0
             && (new_position_abs < u128::from(self.config.minimum_position_size_atoms)
                 || new_position_abs > u128::from(self.config.maximum_position_size_atoms))
         {
@@ -2363,8 +2367,15 @@ impl MarketState {
         let next_capped = next_materialized
             .checked_add(next_reserve)
             .ok_or(StateError::ArithmeticOverflow)?;
-        // Sanity check
-        if next_capped > self.config.hard_gross_open_interest_cap_atoms {
+        let current_capped = self
+            .materialized_gross_open_interest
+            .checked_add(self.pending_maker_oi_reserve)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        // A cap cut must not trap a fill that was already reserved. Maturity
+        // can replace that reserve as long as capped open interest does not grow.
+        if next_capped > self.config.hard_gross_open_interest_cap_atoms
+            && !(self.is_matured() && next_capped <= current_capped)
+        {
             return Err(StateError::Conflict);
         }
         self.materialized_gross_open_interest = next_materialized;
