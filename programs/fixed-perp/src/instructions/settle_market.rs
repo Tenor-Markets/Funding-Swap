@@ -2,9 +2,8 @@
 use anchor_lang::prelude::*;
 
 use crate::instructions::materialize_subaccount::materialize_market;
-use crate::instructions::oracle::read_current_settlement_ratio;
 use crate::state::{
-    MarginGroup, MarketState, StateError, StateResult, Subaccount, MARKET_ACTIVE,
+    MarginGroup, MarketState, SettlementRatio, StateError, StateResult, Subaccount, MARKET_ACTIVE,
     MARKET_CLOSE_ONLY, MARKET_MATURED, MAX_MARKETS,
 };
 
@@ -71,24 +70,13 @@ fn market_account_for_slot<'info>(
     Err(StateError::InvalidMarket.into())
 }
 
-/// Outcome of materializing one slot before any current price is read.
-///
-/// A zero post-materialization balance has nothing to convert. A matured
-/// balance uses the frozen ratio already stored on the market. Only a live
-/// nonzero balance still needs the current collateral/settlement price.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreparedSettlement {
-    SettledWithoutPrice,
-    NeedsCurrentPrice,
-}
-
 fn prepare_market_settlement(
     subaccount: &mut Subaccount,
     slot_index: usize,
     market: &mut MarketState,
     collateral_state: Pubkey,
     settlement_state: Pubkey,
-) -> StateResult<PreparedSettlement> {
+) -> StateResult<()> {
     if !matches!(
         market.status.0,
         MARKET_ACTIVE | MARKET_CLOSE_ONLY | MARKET_MATURED
@@ -106,18 +94,23 @@ fn prepare_market_settlement(
     materialize_market(subaccount, market, slot_index)?;
 
     if subaccount.markets[slot_index].settlement_balance_atoms == 0 {
-        return Ok(PreparedSettlement::SettledWithoutPrice);
+        return Ok(());
     }
 
-    if market.is_matured() {
-        let ratio = market
+    // A live oracle price would let the two sides of one payment convert at
+    // different rates. The same asset converts one-for-one. Different assets
+    // wait for the single frozen maturity ratio.
+    let ratio = if market.is_matured() {
+        market
             .frozen_settlement_ratio()
-            .ok_or(StateError::InvalidStatus)?;
-        subaccount.settle_market_into_collateral(slot_index, market, ratio)?;
-        return Ok(PreparedSettlement::SettledWithoutPrice);
-    }
-
-    Ok(PreparedSettlement::NeedsCurrentPrice)
+            .ok_or(StateError::InvalidStatus)?
+    } else if collateral_state == settlement_state {
+        SettlementRatio::new(1, 1)?
+    } else {
+        return Ok(());
+    };
+    subaccount.settle_market_into_collateral(slot_index, market, ratio)?;
+    Ok(())
 }
 
 fn reject_unused_price_accounts(accounts: &[AccountInfo<'_>]) -> Result<()> {
@@ -177,15 +170,14 @@ fn reject_duplicate_markets(supplied: &SuppliedMarkets<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Converts one slot's settlement balance into collateral.
+/// Materializes one slot and converts its settlement balance into collateral.
 ///
-/// Remaining accounts are the current-price pair only when materialization
-/// leaves a nonzero balance on a market that is not yet matured. A matured
-/// market uses its frozen ratio, and a zero balance takes no price accounts.
+/// The same collateral and settlement asset converts one-for-one. A matured
+/// market uses its frozen ratio. A different settlement asset stays in the
+/// slot until that ratio is frozen. No oracle accounts are read.
 pub fn handle_settle_market_into_collateral<'info>(
     context: Context<'info, SettleMarketIntoCollateral<'info>>,
 ) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
     let (collateral_state, settlement_state) = {
         let group = context.accounts.margin_group.load()?;
         (group.collateral_state, group.settlement_state)
@@ -199,7 +191,7 @@ pub fn handle_settle_market_into_collateral<'info>(
             .ok_or(StateError::InvalidMarket)?
     };
 
-    let prepared = {
+    {
         let mut subaccount = context.accounts.subaccount.load_mut()?;
         let mut market = context.accounts.market.load_mut()?;
         prepare_market_settlement(
@@ -208,80 +200,39 @@ pub fn handle_settle_market_into_collateral<'info>(
             &mut market,
             collateral_state,
             settlement_state,
-        )?
-    };
-
-    match prepared {
-        PreparedSettlement::SettledWithoutPrice => {
-            reject_unused_price_accounts(context.remaining_accounts)
-        }
-        PreparedSettlement::NeedsCurrentPrice => {
-            let ratio = read_current_settlement_ratio(
-                context.remaining_accounts,
-                collateral_state,
-                settlement_state,
-                now,
-            )?;
-            let mut subaccount = context.accounts.subaccount.load_mut()?;
-            let market = context.accounts.market.load()?;
-            subaccount.settle_market_into_collateral(slot_index, &market, ratio)?;
-            Ok(())
-        }
+        )?;
     }
+    reject_unused_price_accounts(context.remaining_accounts)
 }
 
-/// Converts every supplied slot. Market accounts come first. The current-price
-/// pair follows only when at least one live slot still has a settlement balance
-/// after materialization.
+/// Materializes every supplied market. Market accounts are the whole
+/// remaining-account list. Settlement converts under the same rules as the
+/// single-market instruction.
 pub fn handle_settle_all_markets_into_collateral<'info>(
     context: Context<'info, SettleAllMarketsIntoCollateral<'info>>,
 ) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
     let (collateral_state, settlement_state) = {
         let group = context.accounts.margin_group.load()?;
         (group.collateral_state, group.settlement_state)
     };
-    let (supplied, price_accounts) = read_supplied_markets(context.remaining_accounts)?;
+    let (supplied, extra_accounts) = read_supplied_markets(context.remaining_accounts)?;
     reject_duplicate_markets(&supplied)?;
+    reject_unused_price_accounts(extra_accounts)?;
 
-    let mut price_slots = [None; MAX_MARKETS];
-    let mut price_count = 0usize;
-    {
-        let mut subaccount = context.accounts.subaccount.load_mut()?;
-        for (index, loader) in supplied.loaders.iter().enumerate().take(supplied.count) {
-            let loader = loader.as_ref().ok_or(StateError::InvalidMarket)?;
-            let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
-            let slot_index = subaccount
-                .lookup_market(market.config.market_id)
-                .ok_or(StateError::InvalidMarket)?;
-            if prepare_market_settlement(
-                &mut subaccount,
-                slot_index,
-                &mut market,
-                collateral_state,
-                settlement_state,
-            )? == PreparedSettlement::NeedsCurrentPrice
-            {
-                price_slots[price_count] = Some((index, slot_index));
-                price_count += 1;
-            }
-        }
-    }
-
-    if price_count == 0 {
-        return reject_unused_price_accounts(price_accounts);
-    }
-
-    let ratio =
-        read_current_settlement_ratio(price_accounts, collateral_state, settlement_state, now)?;
     let mut subaccount = context.accounts.subaccount.load_mut()?;
-    for entry in price_slots.into_iter().flatten() {
-        let (loader_index, slot_index) = entry;
-        let loader = supplied.loaders[loader_index]
-            .as_ref()
+    for loader in supplied.loaders.iter().take(supplied.count) {
+        let loader = loader.as_ref().ok_or(StateError::InvalidMarket)?;
+        let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+        let slot_index = subaccount
+            .lookup_market(market.config.market_id)
             .ok_or(StateError::InvalidMarket)?;
-        let market = loader.load().map_err(|_| StateError::InvalidMarket)?;
-        subaccount.settle_market_into_collateral(slot_index, &market, ratio)?;
+        prepare_market_settlement(
+            &mut subaccount,
+            slot_index,
+            &mut market,
+            collateral_state,
+            settlement_state,
+        )?;
     }
     Ok(())
 }

@@ -1990,9 +1990,10 @@ impl MarketState {
 
     /// Settles the slot's current position through both indices without resetting snapshots.
     /// The caller materializes pending orders before invoking the separate snapshot reset.
+    /// The settlement fee debited here is credited to the market's protocol fee ledger.
     /// The `market_slot_index` passed is expected to be valid.
     pub fn materialize_position_indices(
-        &self,
+        &mut self,
         subaccount: &mut Subaccount,
         market_slot_index: usize,
     ) -> StateResult<()> {
@@ -2035,8 +2036,13 @@ impl MarketState {
             .checked_add(floating_atoms)
             .and_then(|value| value.checked_sub(i128::try_from(fee_atoms).ok()?))
             .ok_or(StateError::ArithmeticOverflow)?;
+        let next_accrued_fee = self
+            .accrued_protocol_fee_atoms
+            .checked_add(fee_atoms)
+            .ok_or(StateError::ArithmeticOverflow)?;
 
         subaccount.markets[market_slot_index].settlement_balance_atoms = next_settlement_balance;
+        self.accrued_protocol_fee_atoms = next_accrued_fee;
         Ok(())
     }
 
@@ -2087,13 +2093,9 @@ impl MarketState {
             return Ok(());
         }
 
-        // Pending index bases are fill-size weighted. Convert the weighted
-        // Q64.64 delta with one whole underlying unit so the atomic decimal
-        // denominator is not applied a second time.
-        let weighted_index_conversion_atoms = 10i128
-            .checked_pow(u32::from(self.config.underlying_decimals))
-            .ok_or(StateError::ArithmeticOverflow)?;
-
+        // The pending basis is already fill-size weighted. The payment formula
+        // therefore multiplies by one atom and still divides by the underlying
+        // decimal scale once, matching position-index settlement.
         let next_position = subaccount.markets[slot_index]
             .position_size
             .checked_add(pending)
@@ -2106,7 +2108,7 @@ impl MarketState {
             fixed::types::I64F64::from_bits(floating_delta),
         )
         .floating_payment_atoms_scaled(
-            weighted_index_conversion_atoms,
+            1,
             self.config.underlying_decimals,
             self.config.settlement_decimals,
             self.config.tick_scale,
@@ -2121,8 +2123,7 @@ impl MarketState {
         )
         .map_err(|_| StateError::ArithmeticOverflow)?
         .settlement_fee_atoms_scaled(
-            u128::try_from(weighted_index_conversion_atoms)
-                .map_err(|_| StateError::ArithmeticOverflow)?,
+            1,
             self.config.underlying_decimals,
             self.config.settlement_decimals,
             self.config.tick_scale,
@@ -2135,6 +2136,10 @@ impl MarketState {
         let next_cash = subaccount.markets[slot_index]
             .settlement_balance_atoms
             .checked_add(cash_delta)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let next_accrued_fee = self
+            .accrued_protocol_fee_atoms
+            .checked_add(fee_atoms)
             .ok_or(StateError::ArithmeticOverflow)?;
         let old_position_abs =
             u128::from(subaccount.markets[slot_index].position_size.unsigned_abs());
@@ -2152,6 +2157,7 @@ impl MarketState {
         self.materialize_pending_maker_oi(pending_abs, old_position_abs, new_position_abs)?;
 
         subaccount.markets[slot_index].settlement_balance_atoms = next_cash;
+        self.accrued_protocol_fee_atoms = next_accrued_fee;
         subaccount.markets[slot_index].position_size = next_position;
         subaccount.markets[slot_index].order_risk = next_risk;
         if remaining_size == 0 {

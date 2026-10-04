@@ -2,7 +2,7 @@
 use anchor_lang::prelude::*;
 
 use crate::instructions::oracle::{
-    read_asset_observation, settlement_ratio_with_guards, underlying_settlement_price,
+    read_asset_observation, settlement_ratio, underlying_settlement_price,
 };
 use crate::state::{MarketState, StateError, MARKET_ACTIVE, MARKET_CLOSE_ONLY};
 
@@ -49,18 +49,8 @@ fn finalize_one_market<'info>(
     let (collateral_asset, remaining) = read_asset_observation(remaining, collateral_key, now)?;
     let (settlement_asset, _) = read_asset_observation(remaining, settlement_key, now)?;
 
-    let (ratio, index_price) = {
-        let collateral_guard = collateral_asset.loader.load()?;
-        let settlement_guard = settlement_asset.loader.load()?;
-        let ratio = settlement_ratio_with_guards(
-            &collateral_asset,
-            &settlement_asset,
-            &collateral_guard,
-            &settlement_guard,
-        )?;
-        let index_price = underlying_settlement_price(&underlying_asset, &settlement_asset)?;
-        (ratio, index_price)
-    };
+    let ratio = settlement_ratio(&collateral_asset, &settlement_asset)?;
+    let index_price = underlying_settlement_price(&underlying_asset, &settlement_asset)?;
     let mut market = market_loader.load_mut()?;
     let maturity = market.config.maturity_timestamp;
     market.advance_fee_index_with_price(maturity, index_price)?;
@@ -98,14 +88,7 @@ pub fn handle_finalize_markets<'info>(context: Context<'info, FinalizeMarkets>) 
         let (settlement, rest) =
             read_asset_observation(remaining_after_collateral, settlement_key, now)?;
         remaining = rest;
-        let collateral_guard = collateral.loader.load()?;
-        let settlement_guard = settlement.loader.load()?;
-        let ratio = settlement_ratio_with_guards(
-            &collateral,
-            &settlement,
-            &collateral_guard,
-            &settlement_guard,
-        )?;
+        let ratio = settlement_ratio(&collateral, &settlement)?;
         let index_price = underlying_settlement_price(&underlying, &settlement)?;
 
         let mut market = loader.load_mut()?;
