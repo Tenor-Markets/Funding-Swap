@@ -15,9 +15,7 @@ pub struct CancelAssetGovernance<'info> {
     pub asset_governance: AccountLoader<'info, AssetGovernance>,
 }
 
-pub fn handle_cancel_asset_governance(
-    context: Context<CancelAssetGovernance>,
-) -> Result<()> {
+pub fn handle_cancel_asset_governance(context: Context<CancelAssetGovernance>) -> Result<()> {
     context
         .accounts
         .asset_governance

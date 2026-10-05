@@ -284,3 +284,50 @@ impl AssetState {
         }
     }
 }
+
+/// Delayed authorization to withdraw booked protocol fees from one asset.
+/// The executable amount is computed from matured fee ledgers, not stored here.
+#[account]
+#[derive(Debug, InitSpace)]
+pub struct PendingProtocolFeeCollection {
+    pub asset: Pubkey,
+    pub destination: Pubkey,
+    pub rent_recipient: Pubkey,
+    pub window: super::ProposalWindow,
+}
+
+impl PendingProtocolFeeCollection {
+    pub const SPACE: usize = 8 + Self::INIT_SPACE;
+
+    pub fn initialize_in_place(
+        &mut self,
+        asset: Pubkey,
+        destination: Pubkey,
+        rent_recipient: Pubkey,
+        window: super::ProposalWindow,
+    ) -> StateResult<()> {
+        if asset == Pubkey::default()
+            || destination == Pubkey::default()
+            || rent_recipient == Pubkey::default()
+        {
+            return Err(StateError::InvalidConfiguration);
+        }
+        self.asset = asset;
+        self.destination = destination;
+        self.rent_recipient = rent_recipient;
+        self.window = window;
+        Ok(())
+    }
+
+    pub fn is_same_asset(&self, key: Pubkey) -> bool {
+        self.asset == key
+    }
+
+    pub fn is_same_destination(&self, key: Pubkey) -> bool {
+        self.destination == key
+    }
+
+    pub fn is_same_rent_recipient(&self, key: Pubkey) -> bool {
+        self.rent_recipient == key
+    }
+}

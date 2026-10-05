@@ -4,8 +4,8 @@ use anchor_spl::token::TokenAccount;
 
 use crate::instructions::administration::common::creation_window;
 use crate::state::{
-    AssetGovernance, AssetState, GlobalGovernanceConfig, GovernanceCategory, PriceModel, StateError,
-    PRICE_MODEL_FIXED,
+    AssetGovernance, AssetState, GlobalGovernanceConfig, GovernanceCategory, PriceModel,
+    StateError, PRICE_MODEL_FIXED,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]

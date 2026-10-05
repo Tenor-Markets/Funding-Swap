@@ -13,9 +13,7 @@ pub struct ExecuteAssetGovernance<'info> {
     pub asset_governance: AccountLoader<'info, AssetGovernance>,
 }
 
-pub fn handle_execute_asset_governance(
-    context: Context<ExecuteAssetGovernance>,
-) -> Result<()> {
+pub fn handle_execute_asset_governance(context: Context<ExecuteAssetGovernance>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let mut asset = context.accounts.asset.load_mut()?;
     context

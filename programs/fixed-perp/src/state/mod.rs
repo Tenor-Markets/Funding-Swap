@@ -40,6 +40,6 @@ pub use valuation::{
     PRICE_MODEL_FIXED, PRICE_MODEL_FLOATING, PRICE_MODEL_PEGGED,
 };
 pub use vault::{
-    AssetState, WithdrawalWindow, ASSET_ACTIVE, ASSET_PENDING,
+    AssetState, PendingProtocolFeeCollection, WithdrawalWindow, ASSET_ACTIVE, ASSET_PENDING,
     ONE_HOUR_SECONDS,
 };

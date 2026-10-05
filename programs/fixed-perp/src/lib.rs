@@ -35,7 +35,9 @@ pub mod fixed_perp {
         context: Context<CreateMarginGroup>,
         args: CreateMarginGroupArgs,
     ) -> Result<()> {
-        instructions::administration::group::create_margin_group::handle_create_margin_group(context, args)
+        instructions::administration::group::create_margin_group::handle_create_margin_group(
+            context, args,
+        )
     }
 
     pub fn allocate_market(context: Context<AllocateMarket>, market_id: u32) -> Result<()> {
@@ -272,9 +274,7 @@ pub mod fixed_perp {
         instructions::administration::group::execute_margin_group_governance::handle_execute_margin_group_governance(context)
     }
 
-    pub fn execute_asset_governance(
-        context: Context<ExecuteAssetGovernance>,
-    ) -> Result<()> {
+    pub fn execute_asset_governance(context: Context<ExecuteAssetGovernance>) -> Result<()> {
         instructions::administration::vault::execute_asset_governance::handle_execute_asset_governance(context)
     }
 
@@ -291,9 +291,27 @@ pub mod fixed_perp {
         instructions::administration::group::cancel_margin_group_governance::handle_cancel_margin_group_governance(context)
     }
 
-    pub fn cancel_asset_governance(
-        context: Context<CancelAssetGovernance>,
+    pub fn cancel_asset_governance(context: Context<CancelAssetGovernance>) -> Result<()> {
+        instructions::administration::vault::cancel_asset_governance::handle_cancel_asset_governance(
+            context,
+        )
+    }
+
+    pub fn propose_protocol_fee_collection(
+        context: Context<ProposeProtocolFeeCollection>,
     ) -> Result<()> {
-        instructions::administration::vault::cancel_asset_governance::handle_cancel_asset_governance(context)
+        instructions::administration::vault::propose_protocol_fee_collection::handle_propose_protocol_fee_collection(context)
+    }
+
+    pub fn cancel_protocol_fee_collection(
+        context: Context<CancelProtocolFeeCollection>,
+    ) -> Result<()> {
+        instructions::administration::vault::cancel_protocol_fee_collection::handle_cancel_protocol_fee_collection(context)
+    }
+
+    pub fn execute_protocol_fee_collection<'info>(
+        context: Context<'info, ExecuteProtocolFeeCollection<'info>>,
+    ) -> Result<()> {
+        instructions::administration::vault::execute_protocol_fee_collection::handle_execute_protocol_fee_collection(context)
     }
 }

@@ -448,6 +448,70 @@ impl MarketState {
         self.status.0 == MARKET_MATURED
     }
 
+    /// Collateral atoms the protocol may remove for this market's booked fees.
+    ///
+    /// Every slot must already be closed, so its settlement has been folded
+    /// into collateral claims and this fee was not credited to a user. A
+    /// matured market converts the fee at the same frozen ratio, floored.
+    /// The same asset is already denominated in collateral atoms.
+    pub fn accrued_fee_collateral_atoms(&self) -> StateResult<u128> {
+        if !self.is_matured() || self.subaccount_count != 0 {
+            return Err(StateError::InvalidStatus);
+        }
+        if self.materialized_gross_open_interest != 0 || self.pending_maker_oi_reserve != 0 {
+            return Err(StateError::Conflict);
+        }
+        let fees = self.accrued_protocol_fee_atoms;
+        if fees == 0 {
+            return Ok(0);
+        }
+        if self.config.collateral_state == self.config.settlement_state {
+            return Ok(fees);
+        }
+        let fees = i128::try_from(fees).map_err(|_| StateError::ArithmeticOverflow)?;
+        let collateral = self
+            .frozen_settlement_ratio()
+            .ok_or(StateError::InvalidStatus)?
+            .apply(fees)?;
+        u128::try_from(collateral).map_err(|_| StateError::ArithmeticOverflow)
+    }
+
+    /// Zeros booked fees on the supplied matured markets and returns the
+    /// collateral atoms those fees entitle the protocol to withdraw.
+    /// Nothing is changed if any market is ineligible or the total is zero.
+    pub fn take_matured_protocol_fees(
+        asset: Pubkey,
+        markets: &mut [&mut Self],
+    ) -> StateResult<u64> {
+        if markets.is_empty() {
+            return Err(StateError::InvalidConfiguration);
+        }
+        let mut total = 0u128;
+        for (index, market) in markets.iter().enumerate() {
+            if market.config.collateral_state != asset {
+                return Err(StateError::InvalidKey);
+            }
+            let market_id = market.config.market_id;
+            if markets[..index]
+                .iter()
+                .any(|earlier| earlier.config.market_id == market_id)
+            {
+                return Err(StateError::InvalidRemainingAccounts);
+            }
+            total = total
+                .checked_add(market.accrued_fee_collateral_atoms()?)
+                .ok_or(StateError::ArithmeticOverflow)?;
+        }
+        if total == 0 {
+            return Err(StateError::InvalidConfiguration);
+        }
+        let amount = u64::try_from(total).map_err(|_| StateError::ArithmeticOverflow)?;
+        for market in markets.iter_mut() {
+            market.accrued_protocol_fee_atoms = 0;
+        }
+        Ok(amount)
+    }
+
     /// Applies a side to a bounded unsigned amount for an internal fill.
     fn signed_amount(amount: u64, side: Side) -> StateResult<i64> {
         // A value greater than i64::MAX is not expected to be passed, but we err as opposed to unwrapping.
