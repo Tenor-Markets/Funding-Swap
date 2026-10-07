@@ -11,6 +11,7 @@ pub use instructions::close_subaccount::*;
 pub use instructions::create_subaccount::*;
 pub use instructions::deposit_asset::*;
 pub use instructions::finalize_market::*;
+pub use instructions::liquidate::*;
 pub use instructions::materialize_subaccount::*;
 pub use instructions::order::*;
 pub use instructions::refresh_market::*;
@@ -108,6 +109,14 @@ pub mod fixed_perp {
         amount: u64,
     ) -> Result<()> {
         instructions::withdraw_asset::handle_withdraw_asset(context, amount)
+    }
+
+    pub fn liquidate<'info>(
+        context: Context<'info, Liquidate<'info>>,
+        market_id: u32,
+        size_to_liquidator: i64,
+    ) -> Result<()> {
+        instructions::liquidate::handle_liquidate(context, market_id, size_to_liquidator)
     }
 
     pub fn initialize_governance(

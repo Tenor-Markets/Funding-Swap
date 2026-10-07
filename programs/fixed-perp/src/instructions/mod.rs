@@ -6,6 +6,7 @@ pub mod close_subaccount;
 pub mod create_subaccount;
 pub mod deposit_asset;
 pub mod finalize_market;
+pub mod liquidate;
 pub mod materialize_subaccount;
 pub(crate) mod oracle;
 pub mod order;
@@ -19,6 +20,7 @@ pub use close_market::CloseMarket;
 pub use close_subaccount::CloseSubaccount;
 pub use create_subaccount::CreateSubaccount;
 pub use deposit_asset::DepositAsset;
+pub use liquidate::Liquidate;
 pub use materialize_subaccount::MaterializeSubaccount;
 pub use refresh_market::RefreshMarket;
 pub use settle_market::{

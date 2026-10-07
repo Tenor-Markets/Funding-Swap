@@ -512,6 +512,200 @@ impl MarketState {
         Ok(amount)
     }
 
+    /// Transfers `size_to_liquidator` of the victim's position to the liquidator.
+    ///
+    /// This is the Boros liquidation swap: the victim is reduce-only, the
+    /// liquidator does not need a prior position, the incentive is
+    /// `min(k, health_ratio)` times the maintenance-margin drop, and the
+    /// liquidation fee is charged only to the liquidator. The liquidator pays
+    /// or receives the fixed cash flow of the size they take; the victim
+    /// receives the opposite flow and pays the incentive. `health_ratio` must
+    /// already be the victim's portfolio ratio in `[0, 1)`.
+    pub fn liquidate(
+        &mut self,
+        victim: &mut Subaccount,
+        liquidator: &mut Subaccount,
+        size_to_liquidator: i64,
+        health_ratio: FixedPoint,
+        now: i64,
+    ) -> StateResult<(i128, u128, i128)> {
+        if !self.is_active() && !self.is_close_only() {
+            return Err(StateError::InvalidStatus);
+        }
+        let ratio = health_ratio.to_i64f64();
+        if ratio < I64F64::ZERO || ratio >= I64F64::ONE {
+            return Err(StateError::InvalidStatus);
+        }
+        let time_to_maturity = self
+            .config
+            .maturity_timestamp
+            .checked_sub(now)
+            .ok_or(StateError::InvalidClock)?;
+        if time_to_maturity <= 0 {
+            return Err(StateError::InvalidStatus);
+        }
+
+        let victim_slot = victim
+            .lookup_market(self.config.market_id)
+            .ok_or(StateError::NotFound)?;
+        let old_victim = victim.markets[victim_slot].position_size;
+        if size_to_liquidator == 0
+            || old_victim == 0
+            || size_to_liquidator.signum() != old_victim.signum()
+            || size_to_liquidator.unsigned_abs() > old_victim.unsigned_abs()
+        {
+            return Err(StateError::Conflict);
+        }
+        let new_victim = old_victim
+            .checked_sub(size_to_liquidator)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let old_liquidator = liquidator
+            .lookup_market(self.config.market_id)
+            .map(|slot| liquidator.markets[slot].position_size)
+            .unwrap_or(0);
+        let new_liquidator = old_liquidator
+            .checked_add(size_to_liquidator)
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        let mark = self.current_mark_rate(now)?;
+        let no_orders = super::OrderRiskAggregate::zeroed();
+        let margin_before = self.maintenance_margin(
+            self.risk_principal(old_victim, &no_orders, mark)?,
+            time_to_maturity,
+        )?;
+        let margin_after = self.maintenance_margin(
+            self.risk_principal(new_victim, &no_orders, mark)?,
+            time_to_maturity,
+        )?;
+        // Boros subtracts the two maintenance margins as uints, so an increase
+        // reverts rather than paying a zero incentive.
+        let margin_drop = margin_before
+            .checked_sub(margin_after)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        if margin_drop < 0 {
+            return Err(StateError::ArithmeticOverflow);
+        }
+        let complement = I64F64::ONE
+            .checked_sub(ratio)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let k = self
+            .config
+            .liquidation_base_incentive
+            .to_i64f64()
+            .checked_add(
+                self.config
+                    .liquidation_incentive_slope
+                    .to_i64f64()
+                    .checked_mul(complement)
+                    .ok_or(StateError::ArithmeticOverflow)?,
+            )
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let factor = if k < ratio { k } else { ratio };
+        if factor < I64F64::ZERO {
+            return Err(StateError::InvalidConfiguration);
+        }
+        let incentive = FixedPoint::from_i64f64(factor)
+            .checked_mul_int(margin_drop)
+            .map_err(|_| StateError::ArithmeticOverflow)?
+            .floor_atoms()
+            .map_err(|_| StateError::ArithmeticOverflow)?;
+        // This is the cash flow of the account that receives
+        // `size_to_liquidator`. A long pays fixed, so the value is negative
+        // for a positive size at a positive mark. The victim takes the
+        // opposite flow and pays the incentive; the fee stays with the
+        // liquidator. The two fixed legs are exact negations, so user cash
+        // plus the booked fee is zero.
+        let fixed_cash = Rate::from_i64f64(mark.to_i64f64())
+            .fixed_payment_atoms_scaled(
+                i128::from(size_to_liquidator),
+                time_to_maturity,
+                SECONDS_PER_YEAR,
+                self.config.underlying_decimals,
+                self.config.settlement_decimals,
+                self.config.tick_scale,
+            )
+            .map_err(|_| StateError::ArithmeticOverflow)?;
+        let fee =
+            self.liquidation_fee_atoms(size_to_liquidator.unsigned_abs(), time_to_maturity)?;
+        let fee_i128 = i128::try_from(fee).map_err(|_| StateError::ArithmeticOverflow)?;
+        let victim_cash = fixed_cash
+            .checked_neg()
+            .and_then(|value| value.checked_sub(incentive))
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let liquidator_cash = fixed_cash
+            .checked_add(incentive)
+            .and_then(|value| value.checked_sub(fee_i128))
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let next_open_interest = self
+            .materialized_gross_open_interest
+            .checked_sub(u128::from(old_victim.unsigned_abs()))
+            .and_then(|value| value.checked_add(u128::from(new_victim.unsigned_abs())))
+            .and_then(|value| value.checked_sub(u128::from(old_liquidator.unsigned_abs())))
+            .and_then(|value| value.checked_add(u128::from(new_liquidator.unsigned_abs())))
+            .ok_or(StateError::Conflict)?;
+        let next_fees = self
+            .accrued_protocol_fee_atoms
+            .checked_add(fee)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let next_victim_settlement = victim.markets[victim_slot]
+            .settlement_balance_atoms
+            .checked_add(victim_cash)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let next_liquidator_settlement = match liquidator.lookup_market(self.config.market_id) {
+            Some(slot) => liquidator.markets[slot]
+                .settlement_balance_atoms
+                .checked_add(liquidator_cash)
+                .ok_or(StateError::ArithmeticOverflow)?,
+            None => {
+                if !liquidator.markets.iter().any(|slot| slot.market_id == 0) {
+                    return Err(StateError::CapacityExhausted);
+                }
+                self.subaccount_count
+                    .checked_add(1)
+                    .ok_or(StateError::ArithmeticOverflow)?;
+                liquidator_cash
+            }
+        };
+
+        // Orders are cancelled only once the transfer is known to fit. A
+        // rejected size, a full liquidator, or a balance that cannot take the
+        // cash leaves the book and both subaccounts unchanged.
+        self.close_all_orders(victim, victim_slot)?;
+        let liquidator_slot = liquidator.ensure_market(self)?;
+        victim.markets[victim_slot].position_size = new_victim;
+        victim.markets[victim_slot].settlement_balance_atoms = next_victim_settlement;
+        liquidator.markets[liquidator_slot].position_size = new_liquidator;
+        liquidator.markets[liquidator_slot].settlement_balance_atoms = next_liquidator_settlement;
+        self.materialized_gross_open_interest = next_open_interest;
+        self.accrued_protocol_fee_atoms = next_fees;
+        Ok((incentive, fee, liquidator_cash))
+    }
+
+    fn liquidation_fee_atoms(&self, size: u64, time_to_maturity: i64) -> StateResult<u128> {
+        let rate = I64F64::from_bits(self.config.liquidation_fee_rate.to_raw_bits());
+        let elapsed =
+            I64F64::checked_from_num(time_to_maturity).ok_or(StateError::ArithmeticOverflow)?;
+        let year =
+            I64F64::checked_from_num(SECONDS_PER_YEAR).ok_or(StateError::ArithmeticOverflow)?;
+        let market_scale = decimal_scale(self.config.tick_scale)?;
+        let settlement_scale = decimal_scale(self.config.settlement_decimals)?;
+        let maturity_scaled_rate = rate
+            .checked_mul(elapsed)
+            .and_then(|value| value.checked_mul(market_scale))
+            .and_then(|value| value.checked_mul(settlement_scale))
+            .and_then(|value| value.checked_div(year))
+            .ok_or(StateError::ArithmeticOverflow)?;
+        fixed_perp_math::rate::FeeRate::try_from_i64f64(maturity_scaled_rate)
+            .map_err(|_| StateError::InvalidConfiguration)?
+            .settlement_fee_atoms_scaled(
+                u128::from(size),
+                self.config.underlying_decimals,
+                0,
+                self.config.tick_scale,
+            )
+            .map_err(|_| StateError::ArithmeticOverflow)
+    }
+
     /// Applies a side to a bounded unsigned amount for an internal fill.
     fn signed_amount(amount: u64, side: Side) -> StateResult<i64> {
         // A value greater than i64::MAX is not expected to be passed, but we err as opposed to unwrapping.
@@ -2886,6 +3080,28 @@ impl PortfolioHealth {
             .checked_add(self.total_value)
             .ok_or(StateError::ArithmeticOverflow)?;
         Ok(available < threshold)
+    }
+
+    /// Boros health ratio `value / maintenance`, accepted only on `[0, 1)`.
+    /// Negative value is bad debt and is not liquidatable here.
+    pub fn liquidation_health_ratio(&self) -> StateResult<FixedPoint> {
+        let MarginRequirement::Maintenance(maintenance) = self.required_margin else {
+            return Err(StateError::Conflict);
+        };
+        if maintenance <= 0 {
+            return Err(StateError::InvalidStatus);
+        }
+        let available = self
+            .adjusted_total_assets
+            .checked_add(self.total_value)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        if available < 0 || available >= maintenance {
+            return Err(StateError::InvalidStatus);
+        }
+        let ratio = I64F64::checked_from_num(available)
+            .and_then(|value| value.checked_div(I64F64::checked_from_num(maintenance)?))
+            .ok_or(StateError::ArithmeticOverflow)?;
+        Ok(FixedPoint::from_i64f64(ratio))
     }
 }
 
