@@ -9,6 +9,7 @@ pub use instructions::close_empty_markets::*;
 pub use instructions::close_market::*;
 pub use instructions::close_subaccount::*;
 pub use instructions::create_subaccount::*;
+pub use instructions::deleverage::*;
 pub use instructions::deposit_asset::*;
 pub use instructions::finalize_market::*;
 pub use instructions::liquidate::*;
@@ -117,6 +118,15 @@ pub mod fixed_perp {
         size_to_liquidator: i64,
     ) -> Result<()> {
         instructions::liquidate::handle_liquidate(context, market_id, size_to_liquidator)
+    }
+
+    pub fn deleverage<'info>(
+        context: Context<'info, Deleverage<'info>>,
+        market_id: u32,
+        size_to_winner: i64,
+        alpha_raw: i128,
+    ) -> Result<()> {
+        instructions::deleverage::handle_deleverage(context, market_id, size_to_winner, alpha_raw)
     }
 
     pub fn initialize_governance(

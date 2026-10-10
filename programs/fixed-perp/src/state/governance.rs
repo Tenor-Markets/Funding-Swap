@@ -3,7 +3,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::{StateError, StateResult};
 
-pub const GOVERNANCE_CATEGORIES: usize = 10;
+pub const GOVERNANCE_CATEGORIES: usize = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GlobalGovernancePolicy {
@@ -43,6 +43,8 @@ pub enum GovernanceCategory {
     Creation = 8,
     /// Governance authority and policy.
     Governance = 9,
+    /// Forced deleveraging of two existing positions.
+    Deleveraging = 10,
 }
 
 impl GovernanceCategory {
@@ -70,6 +72,7 @@ impl TryFrom<u8> for GovernanceCategory {
             7 => Ok(Self::AssetCustody),
             8 => Ok(Self::Creation),
             9 => Ok(Self::Governance),
+            10 => Ok(Self::Deleveraging),
             _ => Err(StateError::InvalidTag),
         }
     }

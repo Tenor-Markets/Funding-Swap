@@ -27,7 +27,7 @@ pub fn handle_risky_order_cleanup<'info>(
     let now = Clock::get()?.unix_timestamp;
     let group = context.accounts.margin_group.load()?;
 
-    let (observations, _) = read_observation_set(
+    let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
         context.remaining_accounts,
         group.collateral_state,
         group.settlement_state,

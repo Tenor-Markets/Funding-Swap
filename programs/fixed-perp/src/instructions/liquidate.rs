@@ -6,8 +6,8 @@ use anchor_lang::prelude::*;
 use crate::instructions::materialize_subaccount::materialize_market;
 use crate::instructions::oracle::{market_observation_for, read_observation_set, ObservationSet};
 use crate::state::{
-    AssetState, MarginGroup, MarketState, PortfolioHealth, PortfolioMarketObservation,
-    StateError, Subaccount, MAX_MARKETS,
+    AssetState, MarginGroup, MarketState, PortfolioHealth, PortfolioMarketObservation, StateError,
+    Subaccount, MAX_MARKETS,
 };
 
 #[derive(Accounts)]
@@ -46,7 +46,7 @@ pub fn handle_liquidate<'info>(
 ) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let group = context.accounts.margin_group.load()?;
-    let (observations, _) = read_observation_set(
+    let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
         context.remaining_accounts,
         group.collateral_state,
         group.settlement_state,
@@ -131,9 +131,9 @@ pub fn handle_liquidate<'info>(
     Ok(())
 }
 
-fn materialize_entered<'info>(
+pub(crate) fn materialize_entered<'info, const N: usize>(
     subaccount: &mut Subaccount,
-    observations: &ObservationSet<'info>,
+    observations: &ObservationSet<'info, N>,
 ) -> Result<()> {
     for slot_index in 0..MAX_MARKETS {
         let market_id = subaccount.markets[slot_index].market_id;
@@ -150,28 +150,28 @@ fn materialize_entered<'info>(
     Ok(())
 }
 
-fn maintenance_health<'info>(
+pub(crate) fn maintenance_health<'info, const N: usize>(
     group: &MarginGroup,
     subaccount: &Subaccount,
-    observations: &ObservationSet<'info>,
+    observations: &ObservationSet<'info, N>,
     now: i64,
 ) -> Result<PortfolioHealth> {
     portfolio_health(group, subaccount, observations, now, true)
 }
 
-fn initial_health<'info>(
+fn initial_health<'info, const N: usize>(
     group: &MarginGroup,
     subaccount: &Subaccount,
-    observations: &ObservationSet<'info>,
+    observations: &ObservationSet<'info, N>,
     now: i64,
 ) -> Result<PortfolioHealth> {
     portfolio_health(group, subaccount, observations, now, false)
 }
 
-fn portfolio_health<'info>(
+fn portfolio_health<'info, const N: usize>(
     group: &MarginGroup,
     subaccount: &Subaccount,
-    observations: &ObservationSet<'info>,
+    observations: &ObservationSet<'info, N>,
     now: i64,
     maintenance: bool,
 ) -> Result<PortfolioHealth> {

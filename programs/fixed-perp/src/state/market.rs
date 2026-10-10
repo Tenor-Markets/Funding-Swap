@@ -22,6 +22,21 @@ fn decimal_scale(decimals: u8) -> StateResult<I64F64> {
     Ok(scale)
 }
 
+/// Signed division that rounds away from zero when the remainder is nonzero
+/// and the operands have the same sign. This is Boros `rawDivCeil`.
+fn ceil_div(numerator: i128, denominator: i128) -> Option<i128> {
+    if denominator == 0 {
+        return None;
+    }
+    let quotient = numerator.checked_div(denominator)?;
+    let remainder = numerator.checked_rem(denominator)?;
+    if remainder != 0 && numerator.signum() == denominator.signum() {
+        quotient.checked_add(1)
+    } else {
+        Some(quotient)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaceOrderIntent {
     pub size: i64,
@@ -679,6 +694,141 @@ impl MarketState {
         self.materialized_gross_open_interest = next_open_interest;
         self.accrued_protocol_fee_atoms = next_fees;
         Ok((incentive, fee, liquidator_cash))
+    }
+
+    /// Reduces two opposite positions. `size_to_winner` is the winner's trade.
+    ///
+    /// This is Boros `forceDeleverage`: pause does not block it, maturity does,
+    /// both trades are reduce-only, only the loser's orders are cancelled, and
+    /// there is no fee. `loser_value` is the loser's portfolio value in
+    /// settlement atoms. A negative value shifts `alpha` of that shortfall from
+    /// the winner to the loser; a nonnegative value trades at the mark. `alpha`
+    /// is a fraction in `[0, 1]`.
+    pub fn deleverage(
+        &mut self,
+        winner: &mut Subaccount,
+        loser: &mut Subaccount,
+        size_to_winner: i64,
+        loser_value: i128,
+        alpha: FixedPoint,
+        now: i64,
+    ) -> StateResult<i128> {
+        let status = self.status.0;
+        if status != MARKET_ACTIVE && status != MARKET_CLOSE_ONLY && status != MARKET_PAUSED {
+            return Err(StateError::InvalidStatus);
+        }
+        let time_to_maturity = self
+            .config
+            .maturity_timestamp
+            .checked_sub(now)
+            .ok_or(StateError::InvalidClock)?;
+        if time_to_maturity <= 0 {
+            return Err(StateError::InvalidStatus);
+        }
+        let alpha_bits = alpha.to_raw_bits();
+        if alpha_bits < 0 || alpha_bits > (1i128 << 64) {
+            return Err(StateError::InvalidConfiguration);
+        }
+
+        let winner_slot = winner
+            .lookup_market(self.config.market_id)
+            .ok_or(StateError::NotFound)?;
+        let loser_slot = loser
+            .lookup_market(self.config.market_id)
+            .ok_or(StateError::NotFound)?;
+        let old_winner = winner.markets[winner_slot].position_size;
+        let old_loser = loser.markets[loser_slot].position_size;
+        let loser_trade = size_to_winner
+            .checked_neg()
+            .ok_or(StateError::ArithmeticOverflow)?;
+        if !Self::trade_reduces(old_winner, size_to_winner)
+            || !Self::trade_reduces(old_loser, loser_trade)
+        {
+            return Err(StateError::Conflict);
+        }
+        let new_winner = old_winner
+            .checked_add(size_to_winner)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let new_loser = old_loser
+            .checked_add(loser_trade)
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        let mark = self.current_mark_rate(now)?;
+        let fixed_cash = Rate::from_i64f64(mark.to_i64f64())
+            .fixed_payment_atoms_scaled(
+                i128::from(size_to_winner),
+                time_to_maturity,
+                SECONDS_PER_YEAR,
+                self.config.underlying_decimals,
+                self.config.settlement_decimals,
+                self.config.tick_scale,
+            )
+            .map_err(|_| StateError::ArithmeticOverflow)?;
+        let loss = Self::attributed_loss(loser_value, alpha, size_to_winner, old_loser)?;
+        let winner_cash = fixed_cash
+            .checked_add(loss)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let loser_cash = winner_cash
+            .checked_neg()
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let next_winner_settlement = winner.markets[winner_slot]
+            .settlement_balance_atoms
+            .checked_add(winner_cash)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let next_loser_settlement = loser.markets[loser_slot]
+            .settlement_balance_atoms
+            .checked_add(loser_cash)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let next_open_interest = self
+            .materialized_gross_open_interest
+            .checked_sub(u128::from(old_winner.unsigned_abs()))
+            .and_then(|value| value.checked_add(u128::from(new_winner.unsigned_abs())))
+            .and_then(|value| value.checked_sub(u128::from(old_loser.unsigned_abs())))
+            .and_then(|value| value.checked_add(u128::from(new_loser.unsigned_abs())))
+            .ok_or(StateError::Conflict)?;
+
+        // The loser's book is cancelled only after the transfer is known to fit.
+        self.close_all_orders(loser, loser_slot)?;
+        winner.markets[winner_slot].position_size = new_winner;
+        winner.markets[winner_slot].settlement_balance_atoms = next_winner_settlement;
+        loser.markets[loser_slot].position_size = new_loser;
+        loser.markets[loser_slot].settlement_balance_atoms = next_loser_settlement;
+        self.materialized_gross_open_interest = next_open_interest;
+        Ok(loss)
+    }
+
+    /// `true` when `trade` is nonzero, no larger than `position`, and not the
+    /// same sign. This is Boros `_isReducedOnly`.
+    fn trade_reduces(position: i64, trade: i64) -> bool {
+        trade != 0
+            && trade.unsigned_abs() <= position.unsigned_abs()
+            && trade.signum() * position.signum() <= 0
+    }
+
+    /// Settlement-atom shortfall moved onto the winner. Zero while the loser
+    /// still has value. Otherwise `floor(loser_value * ceil(alpha * size / position))`,
+    /// which is the cash form of Boros' annualized bankruptcy rate.
+    fn attributed_loss(
+        loser_value: i128,
+        alpha: FixedPoint,
+        size_to_winner: i64,
+        loser_position: i64,
+    ) -> StateResult<i128> {
+        if loser_value >= 0 {
+            return Ok(0);
+        }
+        let numerator = alpha
+            .to_raw_bits()
+            .checked_mul(i128::from(size_to_winner))
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let factor_bits = ceil_div(numerator, i128::from(loser_position))
+            .filter(|factor| *factor >= 0)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        FixedPoint::from_raw_bits(factor_bits)
+            .checked_mul_int(loser_value)
+            .map_err(|_| StateError::ArithmeticOverflow)?
+            .floor_atoms()
+            .map_err(|_| StateError::ArithmeticOverflow)
     }
 
     fn liquidation_fee_atoms(&self, size: u64, time_to_maturity: i64) -> StateResult<u128> {
@@ -3098,6 +3248,22 @@ impl PortfolioHealth {
         if available < 0 || available >= maintenance {
             return Err(StateError::InvalidStatus);
         }
+        self.maintenance_health_ratio()
+    }
+
+    /// Portfolio maintenance ratio `value / maintenance`, including ratios
+    /// outside `[0, 1)`. Deleveraging compares these directly.
+    pub fn maintenance_health_ratio(&self) -> StateResult<FixedPoint> {
+        let MarginRequirement::Maintenance(maintenance) = self.required_margin else {
+            return Err(StateError::Conflict);
+        };
+        if maintenance <= 0 {
+            return Err(StateError::InvalidStatus);
+        }
+        let available = self
+            .adjusted_total_assets
+            .checked_add(self.total_value)
+            .ok_or(StateError::ArithmeticOverflow)?;
         let ratio = I64F64::checked_from_num(available)
             .and_then(|value| value.checked_div(I64F64::checked_from_num(maintenance)?))
             .ok_or(StateError::ArithmeticOverflow)?;

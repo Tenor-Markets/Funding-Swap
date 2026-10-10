@@ -98,6 +98,30 @@ impl SettlementRatio {
         }
     }
 
+    /// Inverts [`Self::apply`]. Collateral atoms become settlement atoms.
+    /// Positive amounts floor and negative amounts move away from zero.
+    pub fn apply_inverse(self, collateral_balance: i128) -> StateResult<i128> {
+        let magnitude = collateral_balance.unsigned_abs();
+        let product = magnitude
+            .checked_mul(self.denominator)
+            .ok_or(StateError::ArithmeticOverflow)?;
+        let quotient = product / self.numerator;
+        let remainder = product % self.numerator;
+        let rounded = if collateral_balance < 0 && remainder != 0 {
+            quotient
+                .checked_add(1)
+                .ok_or(StateError::ArithmeticOverflow)?
+        } else {
+            quotient
+        };
+        if collateral_balance < 0 {
+            let value = i128::try_from(rounded).map_err(|_| StateError::ArithmeticOverflow)?;
+            value.checked_neg().ok_or(StateError::ArithmeticOverflow)
+        } else {
+            i128::try_from(rounded).map_err(|_| StateError::ArithmeticOverflow)
+        }
+    }
+
     /// Constructs collateral-atoms per settlement-atom from positive oracle
     /// mantissas and decimal exponents.  No intermediate floating-point ratio
     /// is formed.

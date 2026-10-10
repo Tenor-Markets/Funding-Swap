@@ -190,7 +190,7 @@ pub fn handle_place_order<'info>(
 
     let group = context.accounts.margin_group.load()?;
 
-    let (observations, maker_account_infos) = read_observation_set(
+    let (observations, maker_account_infos) = read_observation_set::<{crate::state::MAX_MARKETS}>(
         context.remaining_accounts,
         group.collateral_state,
         group.settlement_state,
@@ -338,7 +338,7 @@ pub fn handle_modify_order<'info>(
 
     let group = context.accounts.margin_group.load()?;
 
-    let (observations, _) = read_observation_set(
+    let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
         context.remaining_accounts,
         group.collateral_state,
         group.settlement_state,

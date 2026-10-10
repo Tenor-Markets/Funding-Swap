@@ -22,11 +22,13 @@ pub(crate) struct MarketObservation<'info> {
 
 /// All transient observations for one instruction. The account order is:
 /// collateral AssetState/optional Pyth, settlement AssetState/optional Pyth,
-/// then up to MAX_MARKETS market/underlying AssetState/optional Pyth triples.
-pub(crate) struct ObservationSet<'info> {
+/// then up to `N` market/underlying AssetState/optional Pyth triples.
+/// One subaccount fits in `MAX_MARKETS`. Deleveraging reads both users, so it
+/// uses `2 * MAX_MARKETS`.
+pub(crate) struct ObservationSet<'info, const N: usize = MAX_MARKETS> {
     pub(crate) collateral: AssetObservation<'info>,
     pub(crate) settlement: AssetObservation<'info>,
-    pub(crate) markets: [Option<MarketObservation<'info>>; MAX_MARKETS],
+    pub(crate) markets: [Option<MarketObservation<'info>>; N],
     pub(crate) count: usize,
 }
 
@@ -151,8 +153,8 @@ pub(crate) fn underlying_settlement_price(
     Ok(FixedPoint::from_i64f64(ratio))
 }
 
-pub(crate) fn market_observation_for<'set, 'info>(
-    observations: &'set ObservationSet<'info>,
+pub(crate) fn market_observation_for<'set, 'info, const N: usize>(
+    observations: &'set ObservationSet<'info, N>,
     market_id: u32,
 ) -> Result<&'set MarketObservation<'info>> {
     observations.markets[..observations.count]
@@ -168,23 +170,22 @@ pub(crate) fn market_observation_for<'set, 'info>(
 /// Returns any unconsumed suffix for callers that have another account type
 /// after the observation prefix. Duplicate account metas are consumed normally.
 #[inline(never)]
-pub(crate) fn read_observation_set<'info>(
+pub(crate) fn read_observation_set<'info, const N: usize>(
     accounts: &'info [AccountInfo<'info>],
     collateral_key: Pubkey,
     settlement_key: Pubkey,
     now: i64,
-) -> Result<(ObservationSet<'info>, &'info [AccountInfo<'info>])> {
+) -> Result<(ObservationSet<'info, N>, &'info [AccountInfo<'info>])> {
     let (collateral, mut remaining) = read_asset_observation(accounts, collateral_key, now)?;
     let (settlement, rest) = read_asset_observation(remaining, settlement_key, now)?;
 
     remaining = rest;
 
-    let mut markets: [Option<MarketObservation<'info>>; MAX_MARKETS] =
-        core::array::from_fn(|_| None);
+    let mut markets: [Option<MarketObservation<'info>>; N] = core::array::from_fn(|_| None);
 
     let mut count = 0usize;
 
-    while count < MAX_MARKETS {
+    while count < N {
         let Some(market_info) = remaining.first() else {
             break;
         };
