@@ -1,4 +1,3 @@
-// CHECKED
 pub mod activate_market;
 pub mod activate_market_group_membership;
 pub mod allocate_market;

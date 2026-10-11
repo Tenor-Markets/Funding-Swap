@@ -1,4 +1,3 @@
-// CHECKED
 use anchor_lang::prelude::*;
 
 use crate::instructions::liquidate::{maintenance_health, materialize_entered};

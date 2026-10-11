@@ -1,4 +1,3 @@
-// CHECKED
 pub mod cancel_global_governance;
 pub mod execute_global_governance;
 pub mod initialize_governance;

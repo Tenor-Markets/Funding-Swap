@@ -1,4 +1,3 @@
-// CHECKED
 use super::super::common::{add_change, optional_fixed, MarketMarginGovernanceArgs};
 use crate::state::*;
 use anchor_lang::prelude::*;

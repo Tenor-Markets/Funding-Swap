@@ -1,4 +1,3 @@
-// CHECKED
 pub mod activate_asset;
 pub mod cancel_asset_governance;
 pub mod cancel_protocol_fee_collection;

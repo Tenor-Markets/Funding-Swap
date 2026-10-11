@@ -1,4 +1,3 @@
-// CHECKED
 use crate::state::{
     governance::GOVERNANCE_CATEGORIES, GlobalGovernanceConfig, GlobalGovernancePolicy,
     GovernanceCategory, StateError,

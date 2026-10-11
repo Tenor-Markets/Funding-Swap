@@ -1,4 +1,3 @@
-// CHECKED
 use crate::state::{GlobalGovernanceConfig, GovernanceCategory, StateError};
 use anchor_lang::prelude::*;
 

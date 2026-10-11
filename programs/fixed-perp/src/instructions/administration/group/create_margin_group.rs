@@ -1,4 +1,3 @@
-// CHECKED
 use anchor_lang::prelude::*;
 
 use super::super::common::creation_window;

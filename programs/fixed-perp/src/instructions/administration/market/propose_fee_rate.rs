@@ -1,4 +1,3 @@
-// CHECKED
 use super::super::common::{add_change, optional_fixed, FeeRateGovernanceArgs};
 use crate::state::*;
 use anchor_lang::prelude::*;

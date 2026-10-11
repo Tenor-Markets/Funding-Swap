@@ -1,4 +1,3 @@
-// CHECKED
 use crate::state::GlobalGovernanceConfig;
 use anchor_lang::prelude::*;
 

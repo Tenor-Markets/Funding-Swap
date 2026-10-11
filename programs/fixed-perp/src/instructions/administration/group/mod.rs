@@ -1,4 +1,3 @@
-// CHECKED
 pub mod activate_margin_group;
 pub mod cancel_margin_group_governance;
 pub mod close_margin_group;

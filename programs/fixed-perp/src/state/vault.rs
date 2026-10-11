@@ -1,3 +1,4 @@
+// CHECKED
 use super::{
     FixedPoint, PriceModel, StateError, StateResult, PRICE_MODEL_FIXED, PRICE_MODEL_FLOATING,
     PRICE_MODEL_PEGGED,
@@ -28,21 +29,27 @@ impl WithdrawalWindow {
         if now < 0 || self.duration_seconds == 0 {
             return Err(StateError::InvalidClock);
         }
+
         let epoch =
             u64::try_from(now).map_err(|_| StateError::InvalidClock)? / self.duration_seconds;
+
         let withdrawn = if self.epoch == epoch {
             self.withdrawn_atoms
         } else {
             0
         };
+
         let next = withdrawn
             .checked_add(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         if next > self.limit_atoms {
             return Err(StateError::WithdrawalLimitExceeded);
         }
+
         self.epoch = epoch;
         self.withdrawn_atoms = next;
+
         Ok(())
     }
 }
@@ -148,6 +155,7 @@ impl AssetState {
             }
             _ => return Err(StateError::InvalidTag),
         }
+
         self.asset_id = asset_id;
         self.bump = bump;
         self.governance_key = governance_key;
@@ -179,6 +187,7 @@ impl AssetState {
             ..WithdrawalWindow::default()
         };
         self._pad_3 = [0; 16];
+
         Ok(())
     }
 
@@ -190,8 +199,10 @@ impl AssetState {
         if self.status != ASSET_PENDING {
             return Err(StateError::InvalidStatus);
         }
+
         activation_window.consume(now)?;
         self.status = ASSET_ACTIVE;
+
         Ok(())
     }
 
@@ -221,6 +232,7 @@ impl AssetState {
         {
             return Err(StateError::InvalidReference);
         }
+
         Ok(())
     }
 
@@ -248,8 +260,10 @@ impl AssetState {
         if self.price_model.0 != PRICE_MODEL_PEGGED {
             return Ok(false);
         }
+
         let anchor = self.reference_price.to_i64f64();
         let deviation = self.max_peg_deviation.to_i64f64();
+
         let lower = anchor
             .checked_mul(
                 fixed::types::I64F64::ONE
@@ -257,6 +271,7 @@ impl AssetState {
                     .ok_or(StateError::ArithmeticOverflow)?,
             )
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let upper = anchor
             .checked_mul(
                 fixed::types::I64F64::ONE
@@ -264,7 +279,9 @@ impl AssetState {
                     .ok_or(StateError::ArithmeticOverflow)?,
             )
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let value = price.to_i64f64();
+
         Ok(value >= lower && value <= upper)
     }
 
@@ -312,10 +329,12 @@ impl PendingProtocolFeeCollection {
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         self.asset = asset;
         self.destination = destination;
         self.rent_recipient = rent_recipient;
         self.window = window;
+
         Ok(())
     }
 

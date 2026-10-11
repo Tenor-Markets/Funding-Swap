@@ -1,4 +1,3 @@
-// CHECKED
 use crate::state::{
     GlobalGovernanceConfig, GovernanceCategory, MarketGovernance, MarketState, StateError,
 };

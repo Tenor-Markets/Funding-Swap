@@ -1,4 +1,3 @@
-// CHECKED
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
 

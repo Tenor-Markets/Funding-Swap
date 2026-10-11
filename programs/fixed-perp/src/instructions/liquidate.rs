@@ -1,4 +1,3 @@
-// CHECKED
 use std::cell::Ref;
 
 use anchor_lang::prelude::*;

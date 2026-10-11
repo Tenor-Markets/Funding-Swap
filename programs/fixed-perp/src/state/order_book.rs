@@ -1,3 +1,4 @@
+// CHECKED
 use super::{FixedPoint, StateError, StateResult, MAX_ORDERS};
 use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
@@ -11,11 +12,14 @@ pub const TICK_DIRECTORY_LEN: usize = 65_536;
 pub const FREE_INDEX: u16 = u16::MAX;
 
 /// Maps the signed tick ABI to its shared bitmap and directory position.
+/// Basically it starts counting from the lowest number(i16::min()-(two complement representation: 0x8000)-(this representation: 0x0000)) to
+/// highest number(i16::max()-(two complement representation: 0x7fff)-(this representation: 0xffff)).
 fn tick_index(tick: i16) -> usize {
     usize::from(u16::from_ne_bytes(tick.to_ne_bytes()) ^ 0x8000)
 }
 
 /// Restores a signed tick from its shared bitmap and directory position.
+/// Reverse of the above.
 fn tick_from_index(index: usize) -> i16 {
     i16::from_ne_bytes(((index as u16) ^ 0x8000).to_ne_bytes())
 }
@@ -67,6 +71,7 @@ impl TimeInForce {
         if self.0 > Self::SOFT_ALO.0 {
             return Err(StateError::InvalidTag);
         }
+
         Ok(())
     }
 
@@ -110,7 +115,7 @@ pub struct OrderId {
 pub struct HierarchicalBitmap {
     pub level_zero: [u64; 1_024],
     pub level_one: [u64; 16],
-    pub top: u64,
+    pub top: u64, // We only use the first 16 bits.
 }
 
 #[repr(C)]
@@ -173,11 +178,13 @@ impl OrderBook {
     /// Validates a caller-provided resting size against this book's configured bounds.
     pub(crate) fn validate_order_size(&self, size: i64) -> StateResult<()> {
         let absolute_size = size.unsigned_abs();
+
         if absolute_size < self.minimum_order_size_atoms
             || absolute_size > self.maximum_order_size_atoms
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         Ok(())
     }
 
@@ -185,12 +192,12 @@ impl OrderBook {
 }
 
 impl OrderNode {
-    /// Returns whether this node is free, assuming node invariants hold.
+    /// Returns whether this node is free.
     pub fn is_free(&self) -> bool {
         self.size == 0
     }
 
-    /// Returns whether this node can still receive a match, assuming node invariants hold.
+    /// Returns whether this node can still receive a match.
     pub fn is_executable(&self) -> bool {
         self.remaining_size != 0
     }
@@ -224,23 +231,33 @@ impl HierarchicalBitmap {
     /// Marks a price level present; callers add metadata before setting it.
     fn set(&mut self, tick: i16) {
         let mapped = tick_index(tick);
+
         let word = mapped / 64;
         let bit = mapped % 64;
+
         self.level_zero[word] |= 1u64 << bit;
+
         let upper_word = word / 64;
+
         self.level_one[upper_word] |= 1u64 << (word % 64);
+
         self.top |= 1u64 << upper_word;
     }
 
     /// Marks an empty price level absent after its metadata is released.
     fn clear(&mut self, tick: i16) {
         let mapped = tick_index(tick);
+
         let word = mapped / 64;
         let bit = mapped % 64;
+
         self.level_zero[word] &= !(1u64 << bit);
+
         if self.level_zero[word] == 0 {
             let upper_word = word / 64;
+
             self.level_one[upper_word] &= !(1u64 << (word % 64));
+
             if self.level_one[upper_word] == 0 {
                 self.top &= !(1u64 << upper_word);
             }
@@ -250,6 +267,7 @@ impl HierarchicalBitmap {
     /// Returns whether this bitmap contains a tick; retained for bounded callers.
     pub fn contains(&self, tick: i16) -> bool {
         let mapped = tick_index(tick);
+
         self.level_zero[mapped / 64] & (1u64 << (mapped % 64)) != 0
     }
 
@@ -258,11 +276,15 @@ impl HierarchicalBitmap {
         if self.top == 0 {
             return Err(StateError::NotFound);
         }
+
         let upper_word = self.top.trailing_zeros() as usize;
         let level_one = self.level_one[upper_word];
+
         let word = upper_word * 64 + level_one.trailing_zeros() as usize;
         let level_zero = self.level_zero[word];
+
         let mapped = word * 64 + level_zero.trailing_zeros() as usize;
+
         Ok(tick_from_index(mapped))
     }
 
@@ -271,11 +293,15 @@ impl HierarchicalBitmap {
         if self.top == 0 {
             return Err(StateError::NotFound);
         }
+
         let upper_word = 63 - self.top.leading_zeros() as usize;
         let level_one = self.level_one[upper_word];
+
         let word = upper_word * 64 + (63 - level_one.leading_zeros() as usize);
         let level_zero = self.level_zero[word];
+
         let mapped = word * 64 + (63 - level_zero.leading_zeros() as usize);
+
         Ok(tick_from_index(mapped))
     }
 }
@@ -299,6 +325,7 @@ impl OrderBook {
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         self.next_order_sequence = 1;
         self.minimum_order_size_atoms = minimum_order_size_atoms;
         self.maximum_order_size_atoms = maximum_order_size_atoms;
@@ -306,6 +333,7 @@ impl OrderBook {
         self.tick_step = tick_step;
         self.long_tick_directory.fill(FREE_INDEX);
         self.short_tick_directory.fill(FREE_INDEX);
+
         for index in 0..BOOK_CAPACITY {
             self.tick_metadata[index] = TickMetadata {
                 head: FREE_INDEX,
@@ -317,6 +345,7 @@ impl OrderBook {
                 },
                 ..TickMetadata::zeroed()
             };
+
             self.nodes[index] = OrderNode {
                 previous_node: FREE_INDEX,
                 next_node: if index + 1 < BOOK_CAPACITY {
@@ -327,8 +356,10 @@ impl OrderBook {
                 ..OrderNode::zeroed()
             };
         }
+
         self.free_node_head = 0;
         self.free_tick_metadata_head = 0;
+
         Ok(())
     }
 
@@ -367,12 +398,14 @@ impl OrderBook {
             next_free: self.free_tick_metadata_head,
             ..TickMetadata::zeroed()
         };
+
         self.free_tick_metadata_head = index as u16;
     }
 
     /// Returns the active metadata for a side and tick, if the level exists.
     fn get_metadata(&self, side: Side, tick: i16) -> Option<usize> {
         let index = self.directory(side)[tick_index(tick)];
+
         (index != FREE_INDEX).then_some(usize::from(index))
     }
 
@@ -381,6 +414,7 @@ impl OrderBook {
         let index = usize::from(self.free_tick_metadata_head);
         let next_free = self.tick_metadata[index].next_free;
         self.free_tick_metadata_head = next_free;
+
         self.tick_metadata[index] = TickMetadata {
             tick,
             head,
@@ -388,6 +422,7 @@ impl OrderBook {
             next_free: FREE_INDEX,
             ..TickMetadata::zeroed()
         };
+
         self.directory_mut(side)[tick_index(tick)] = index as u16;
     }
 
@@ -401,6 +436,7 @@ impl OrderBook {
         expiry_timestamp: i64,
     ) -> StateResult<OrderId> {
         let side = if size > 0 { Side::Long } else { Side::Short };
+
         let metadata_index = self.get_metadata(side, tick);
 
         // Check if we still have some room.
@@ -413,9 +449,11 @@ impl OrderBook {
         let index = usize::from(self.free_node_head);
         let next_free = self.nodes[index].next_node;
         let sequence = self.next_order_sequence;
+
         let next_sequence = sequence
             .checked_add(1)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let order_id = OrderId {
             sequence,
             slab_index: index as u64,
@@ -423,6 +461,7 @@ impl OrderBook {
 
         self.free_node_head = next_free;
         self.next_order_sequence = next_sequence;
+
         self.nodes[index] = OrderNode {
             sequence,
             expiry_timestamp,
@@ -445,6 +484,7 @@ impl OrderBook {
             self.add_metadata(side, tick, index as u16, index as u16);
             self.bitmap_mut(side).set(tick);
         }
+
         Ok(order_id)
     }
 
@@ -458,14 +498,17 @@ impl OrderBook {
         if remaining_size.unsigned_abs() > self.nodes[index].remaining_size.unsigned_abs() {
             self.move_to_tail(index)?;
         }
+
         self.nodes[index].size = size;
         self.nodes[index].remaining_size = remaining_size;
+
         Ok(())
     }
 
     /// Commits materialized maker accounting into a still-resting order.
     pub(crate) fn commit_pending_fill(&mut self, index: usize) {
         let remaining = self.nodes[index].remaining_size;
+
         self.nodes[index].size = remaining;
         self.nodes[index].pending_floating_index_basis = FixedPoint::from_raw_bits(0);
         self.nodes[index].pending_fee_index_basis = FixedPoint::from_raw_bits(0);
@@ -476,6 +519,7 @@ impl OrderBook {
     fn move_to_tail(&mut self, index: usize) -> StateResult<()> {
         let side = self.nodes[index].get_side();
         let tick = self.nodes[index].tick;
+
         let previous = self.nodes[index].previous_node;
         let next = self.nodes[index].next_node;
 
@@ -483,9 +527,11 @@ impl OrderBook {
         let metadata_index = self
             .get_metadata(side, tick)
             .ok_or(StateError::InvalidReference)?;
+
         if self.tick_metadata[metadata_index].tail == index as u16 {
             return Ok(());
         }
+
         if previous == FREE_INDEX {
             self.tick_metadata[metadata_index].head = next;
         } else {
@@ -495,11 +541,14 @@ impl OrderBook {
         // We handle the case where next == FREE_INDEX, by handling the case where the order is
         // the tail, that is done above.
         self.nodes[usize::from(next)].previous_node = previous;
+
         let previous_tail = self.tick_metadata[metadata_index].tail;
+
         self.nodes[index].previous_node = previous_tail;
         self.nodes[index].next_node = FREE_INDEX;
         self.nodes[usize::from(previous_tail)].next_node = index as u16;
         self.tick_metadata[metadata_index].tail = index as u16;
+
         Ok(())
     }
 
@@ -507,10 +556,12 @@ impl OrderBook {
     pub(crate) fn close_order(&mut self, index: usize) -> StateResult<()> {
         self.detach_from_fifo(index)?;
         self.release_detached_node(index);
+
         Ok(())
     }
 
     /// Removes a node from its active price-level FIFO without making it reusable.
+    /// The caller is responsible for ensuring the metadata reference left in the order is not reused.
     pub(crate) fn detach_from_fifo(&mut self, index: usize) -> StateResult<()> {
         let side = self.nodes[index].get_side();
         let tick = self.nodes[index].tick;
@@ -519,6 +570,7 @@ impl OrderBook {
         let metadata_index = self
             .get_metadata(side, tick)
             .ok_or(StateError::InvalidReference)?;
+
         let previous = self.nodes[index].previous_node;
         let next = self.nodes[index].next_node;
 
@@ -528,11 +580,13 @@ impl OrderBook {
         } else {
             self.nodes[usize::from(previous)].next_node = next;
         }
+
         if next == FREE_INDEX {
             self.tick_metadata[metadata_index].tail = previous;
         } else {
             self.nodes[usize::from(next)].previous_node = previous;
         }
+
         self.nodes[index].previous_node = FREE_INDEX;
         self.nodes[index].next_node = FREE_INDEX;
 
@@ -542,6 +596,7 @@ impl OrderBook {
             self.directory_mut(side)[tick_index(tick)] = FREE_INDEX;
             self.free_metadata(metadata_index);
         }
+
         Ok(())
     }
 
@@ -552,10 +607,12 @@ impl OrderBook {
             next_node: self.free_node_head,
             ..OrderNode::zeroed()
         };
+
         self.free_node_head = index as u16;
     }
 
     /// Returns the FIFO head at the best price on a side.
+    /// Called with the maker side.
     pub(crate) fn best_head(&self, side: Side) -> StateResult<usize> {
         let tick = self.best_tick(side)?;
 
@@ -563,10 +620,12 @@ impl OrderBook {
         let metadata = self
             .get_metadata(side, tick)
             .ok_or(StateError::InvalidReference)?;
+
         Ok(usize::from(self.tick_metadata[metadata].head))
     }
 
     /// Returns the best occupied tick for the requested side.
+    /// Called with the maker side.
     pub(crate) fn best_tick(&self, side: Side) -> StateResult<i16> {
         if side == Side::Long {
             self.long_bitmap.best_highest()

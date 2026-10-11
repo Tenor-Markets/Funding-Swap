@@ -1,4 +1,3 @@
-// CHECKED
 use super::super::common::*;
 use crate::state::*;
 use anchor_lang::prelude::*;

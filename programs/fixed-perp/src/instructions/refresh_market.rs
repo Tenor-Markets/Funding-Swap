@@ -1,4 +1,3 @@
-// CHECKED
 use core::convert::TryFrom;
 
 use anchor_lang::prelude::*;

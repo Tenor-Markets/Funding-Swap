@@ -1,11 +1,10 @@
-// CHECKED
 use anchor_lang::prelude::*;
 use anchor_spl::token::TokenAccount;
 
 use crate::instructions::administration::common::creation_window;
 use crate::state::{
     AssetGovernance, AssetState, GlobalGovernanceConfig, GovernanceCategory, PriceModel,
-    StateError, PRICE_MODEL_FIXED,
+    StateError,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
@@ -58,10 +57,6 @@ pub fn handle_create_asset(context: Context<CreateAsset>, args: CreateAssetArgs)
         }
         None => Pubkey::default(),
     };
-
-    if args.price_model == PRICE_MODEL_FIXED && token_account != Pubkey::default() {
-        return Err(error!(StateError::InvalidConfiguration));
-    }
 
     let mut asset = context.accounts.asset.load_init()?;
     asset.initialize_in_place(

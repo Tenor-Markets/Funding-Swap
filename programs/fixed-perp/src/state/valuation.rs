@@ -100,13 +100,17 @@ impl SettlementRatio {
 
     /// Inverts [`Self::apply`]. Collateral atoms become settlement atoms.
     /// Positive amounts floor and negative amounts move away from zero.
+    /// It may not reconstruct the original value.
     pub fn apply_inverse(self, collateral_balance: i128) -> StateResult<i128> {
         let magnitude = collateral_balance.unsigned_abs();
+
         let product = magnitude
             .checked_mul(self.denominator)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let quotient = product / self.numerator;
         let remainder = product % self.numerator;
+
         let rounded = if collateral_balance < 0 && remainder != 0 {
             quotient
                 .checked_add(1)
@@ -137,6 +141,7 @@ impl SettlementRatio {
             return Err(StateError::InvalidConfiguration);
         }
 
+        // TODO: This seems to conflict with the comment above the function.
         let mut numerator = u128::from(settlement_price);
         let mut denominator = u128::from(collateral_price);
 
@@ -330,18 +335,24 @@ impl OracleObservation {
         }
 
         let scale = 1u128 << 64;
+
         let confidence = u128::try_from(self.confidence.to_raw_bits())
             .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let price =
             u128::try_from(self.price.to_raw_bits()).map_err(|_| StateError::ArithmeticOverflow)?;
+
         let max_confidence = u128::try_from(max_confidence_ratio.to_raw_bits())
             .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let confidence_bound = price
             .checked_mul(max_confidence)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let confidence_value = confidence
             .checked_mul(scale)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         if confidence_value > confidence_bound {
             return Err(StateError::Conflict);
         }
@@ -352,19 +363,25 @@ impl OracleObservation {
             .checked_sub(self.ema.to_raw_bits())
             .ok_or(StateError::ArithmeticOverflow)?
             .unsigned_abs();
+
         let ema =
             u128::try_from(self.ema.to_raw_bits()).map_err(|_| StateError::ArithmeticOverflow)?;
+
         let max_ema = u128::try_from(max_ema_deviation.to_raw_bits())
             .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let ema_bound = ema
             .checked_mul(max_ema)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let ema_value = delta
             .checked_mul(scale)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         if ema_value > ema_bound {
             return Err(StateError::Conflict);
         }
+
         Ok(())
     }
 
@@ -387,6 +404,7 @@ impl OracleObservation {
         if asset.price_model.0 == PRICE_MODEL_FIXED {
             return Ok(asset.reference_price);
         }
+
         if asset.central_price_is_on_peg(self.price)? {
             Ok(asset.reference_price)
         } else {
@@ -524,7 +542,7 @@ fn scale_pyth_value(mantissa: i128, exponent: i32) -> StateResult<FixedPoint> {
     Ok(FixedPoint::from_i64f64(value))
 }
 
-/// Governance-controlled sign-directed valuation factors.
+/// Sign-directed valuation factors.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
 #[cfg_attr(feature = "idl-build", derive(AnchorSerialize, AnchorDeserialize))]

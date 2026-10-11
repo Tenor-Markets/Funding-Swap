@@ -1,4 +1,3 @@
-// CHECKED
 use super::super::common::{optional_pubkey, optional_u64, optional_u8, GlobalGovernanceArgs};
 use crate::state::*;
 use anchor_lang::prelude::*;

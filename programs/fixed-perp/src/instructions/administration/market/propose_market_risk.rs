@@ -1,4 +1,3 @@
-// CHECKED
 use super::super::common::{
     add_change, optional_fixed, optional_u128, optional_u64, MarketRiskGovernanceArgs,
 };

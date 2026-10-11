@@ -1,4 +1,3 @@
-// CHECKED
 use crate::state::*;
 use anchor_lang::prelude::*;
 

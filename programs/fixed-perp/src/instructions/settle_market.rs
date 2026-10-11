@@ -1,4 +1,3 @@
-// CHECKED
 use anchor_lang::prelude::*;
 
 use crate::instructions::materialize_subaccount::materialize_market;

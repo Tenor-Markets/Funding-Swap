@@ -1,3 +1,4 @@
+// CHECKED
 use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 
@@ -24,7 +25,7 @@ tag_type!(SubaccountStatus);
 #[cfg_attr(feature = "idl-build", derive(AnchorSerialize, AnchorDeserialize))]
 pub struct OrderRiskAggregate {
     // Cached remaining-order risk. It is rebuilt on demand from canonical book
-    // nodes when the market's cache nonce changes, rather than being a source of truth.
+    // nodes when the market's cache nonce changes.
     pub sum_long_order_size: u64,
     pub sum_long_order_pm: FixedPoint,
     pub sum_short_order_size: u64,
@@ -131,15 +132,13 @@ impl Subaccount {
         if authority == Pubkey::default() || subaccount_id == 0 || group_id == 0 {
             return Err(StateError::InvalidConfiguration);
         }
+
         self.authority = authority;
         self.subaccount_id = subaccount_id;
         self.group_id = group_id;
         self.status = super::SubaccountStatus(SUBACCOUNT_ACTIVE);
         self.bump = bump;
         self._pad_0 = [0; 10];
-        // Initializers own the complete fixed layout.  Do not rely on the
-        // caller having supplied a zeroed backing account for any collection
-        // or reserved bytes.
         self.collateral_balance_atoms = 0;
         self.delegate = Pubkey::default();
         self.markets = [MarketSlot::zeroed(); MAX_MARKETS];
@@ -156,7 +155,9 @@ impl Subaccount {
         if delegate == self.authority {
             return Err(StateError::InvalidAuthority);
         }
+
         self.delegate = delegate;
+
         Ok(())
     }
 
@@ -166,6 +167,7 @@ impl Subaccount {
             .collateral_balance_atoms
             .checked_add(i128::from(amount))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         Ok(())
     }
 
@@ -174,18 +176,22 @@ impl Subaccount {
         if let Some(market_slot_index) = self.lookup_market(market.config.market_id) {
             return Ok(market_slot_index);
         }
+
         let market_slot_index = self
             .markets
             .iter()
             .position(|market_slot| market_slot.market_id == 0)
             .ok_or(StateError::CapacityExhausted)?;
+
         market.add_subaccount()?;
+
         self.markets[market_slot_index] = MarketSlot {
             market_id: market.config.market_id,
             floating_index_snapshot: market.floating_index,
             fee_index_snapshot: market.fee_index,
             ..MarketSlot::zeroed()
         };
+
         Ok(market_slot_index)
     }
 
@@ -200,10 +206,12 @@ impl Subaccount {
             .markets
             .get(market_slot_index)
             .ok_or(StateError::InvalidReference)?;
+
         if market_slot.market_id != 0 {
             market.remove_subaccount()?;
             self.markets[market_slot_index] = MarketSlot::zeroed();
         }
+
         Ok(())
     }
 
@@ -219,18 +227,24 @@ impl Subaccount {
             .markets
             .get(market_slot_index)
             .ok_or(StateError::InvalidReference)?;
+
         if slot.market_id != market.config.market_id || market.subaccount_count == 0 {
             return Err(StateError::InvalidMarket);
         }
+
         if slot.settlement_balance_atoms == 0 {
             return Ok(());
         }
+
         let collateral = ratio.apply(slot.settlement_balance_atoms)?;
+
         self.collateral_balance_atoms = self
             .collateral_balance_atoms
             .checked_add(collateral)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         self.markets[market_slot_index].settlement_balance_atoms = 0;
+
         Ok(())
     }
 
@@ -245,6 +259,7 @@ impl Subaccount {
         market_slot_index: usize,
         market: &mut MarketState,
     ) -> StateResult<()> {
+        // TODO: Remove the below check, the callers handle this.
         if !market.is_matured() {
             return Err(StateError::InvalidStatus);
         }
@@ -257,9 +272,7 @@ impl Subaccount {
             .markets
             .get(market_slot_index)
             .ok_or(StateError::InvalidReference)?;
-        if slot.market_id != market.config.market_id || market.subaccount_count == 0 {
-            return Err(StateError::InvalidReference);
-        }
+
         if !slot.order_risk.is_empty()
             || self
                 .iter_order_refs()
@@ -268,27 +281,23 @@ impl Subaccount {
         {
             return Err(StateError::Conflict);
         }
+
         // The position is already in materialized open interest. Retiring it
         // removes that contribution. Pending maker reserve stays until the
         // maker node is materialized, which also removes its order reference.
         let position_abs = u128::from(slot.position_size.unsigned_abs());
+
         let next_open_interest = market
             .materialized_gross_open_interest
             .checked_sub(position_abs)
             .ok_or(StateError::Conflict)?;
-        let collateral_delta = ratio.apply(slot.settlement_balance_atoms)?;
-        if self
-            .collateral_balance_atoms
-            .checked_add(collateral_delta)
-            .is_none()
-        {
-            return Err(StateError::ArithmeticOverflow);
-        }
+
         // Settlement is idempotent once the balance is zero, so a later close
         // failure can be retried without subtracting open interest twice.
         self.settle_market_into_collateral(market_slot_index, market, ratio)?;
+
         market.materialized_gross_open_interest = next_open_interest;
-        self.markets[market_slot_index].position_size = 0;
+
         self.close_market(market_slot_index, market)
     }
 
@@ -340,11 +349,15 @@ impl OrderRiskAggregate {
             .to_raw_bits()
             .checked_abs()
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let floor_raw = rate_floor.to_raw_bits();
+
         if floor_raw < 0 {
             return Err(StateError::InvalidConfiguration);
         }
+
         let effective_raw = rate_raw.max(floor_raw);
+
         let scale = |decimals: u8| -> StateResult<fixed::types::I64F64> {
             let mut value = fixed::types::I64F64::ONE;
             for _ in 0..decimals {
@@ -354,12 +367,18 @@ impl OrderRiskAggregate {
             }
             Ok(value)
         };
+
         let size =
             fixed::types::I64F64::checked_from_num(size).ok_or(StateError::ArithmeticOverflow)?;
+
         let effective_rate = fixed::types::I64F64::from_bits(effective_raw);
+
         let settlement_scale = scale(unit_scale.settlement_decimals)?;
+
         let underlying_scale = scale(unit_scale.underlying_decimals)?;
+
         let tick_scale = scale(unit_scale.tick_scale)?;
+
         effective_rate
             .checked_mul(size)
             .and_then(|value| value.checked_mul(settlement_scale))
@@ -379,16 +398,19 @@ impl OrderRiskAggregate {
         unit_scale: OrderRiskScale,
     ) -> StateResult<()> {
         let contribution = Self::pm_contribution(size, rate, rate_floor, unit_scale)?;
+
         if side == Side::Long {
             let next_size = self
                 .sum_long_order_size
                 .checked_add(size)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let next_pm = self
                 .sum_long_order_pm
                 .to_raw_bits()
                 .checked_add(contribution)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             self.sum_long_order_size = next_size;
             self.sum_long_order_pm = super::FixedPoint::from_raw_bits(next_pm);
         } else {
@@ -396,11 +418,13 @@ impl OrderRiskAggregate {
                 .sum_short_order_size
                 .checked_add(size)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let next_pm = self
                 .sum_short_order_pm
                 .to_raw_bits()
                 .checked_add(contribution)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             self.sum_short_order_size = next_size;
             self.sum_short_order_pm = super::FixedPoint::from_raw_bits(next_pm);
         }
@@ -417,6 +441,7 @@ impl OrderRiskAggregate {
         unit_scale: OrderRiskScale,
     ) -> StateResult<()> {
         let contribution = Self::pm_contribution(size, rate, rate_floor, unit_scale)?;
+
         let (current_size, current_pm) = if side == Side::Long {
             (
                 self.sum_long_order_size,
@@ -428,11 +453,15 @@ impl OrderRiskAggregate {
                 self.sum_short_order_pm.to_raw_bits(),
             )
         };
+
         let next_size = current_size.checked_sub(size).ok_or(StateError::Conflict)?;
+
+        // TODO: Why can't pm be negative?
         let next_pm = current_pm
             .checked_sub(contribution)
             .filter(|value| *value >= 0)
             .ok_or(StateError::Conflict)?;
+
         if side == Side::Long {
             self.sum_long_order_size = next_size;
             self.sum_long_order_pm = super::FixedPoint::from_raw_bits(next_pm);

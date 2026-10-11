@@ -1,4 +1,3 @@
-// CHECKED
 use anchor_lang::prelude::*;
 
 use crate::state::{MarketState, StateError, Subaccount, MAX_MARKETS};
