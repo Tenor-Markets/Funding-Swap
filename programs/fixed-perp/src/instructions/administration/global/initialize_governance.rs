@@ -17,10 +17,6 @@ fn is_upgrade_authority(program_data: &Account<'_, ProgramData>, authority: Pubk
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct GovernanceInitializationArgs {
     pub authorities: [Pubkey; GOVERNANCE_CATEGORIES],
-    pub increase_delays: [u64; GOVERNANCE_CATEGORIES],
-    pub decrease_delays: [u64; GOVERNANCE_CATEGORIES],
-    pub creation_delay_seconds: u64,
-    pub proposal_expiry_seconds: u64,
     pub subaccount_creation_fee_lamports: u64,
     pub subaccount_creation_fee_destination: Pubkey,
 }
@@ -30,7 +26,7 @@ pub struct GovernanceInitializationArgs {
 pub struct InitializeGovernance<'info> {
     #[account(
         mut,
-        constraint = args.authorities[GovernanceCategory::Governance.index()] == authority.key() @ StateError::InvalidAuthority
+        constraint = args.authorities[GovernanceCategory::AuthorityAdministration.index()] == authority.key() @ StateError::InvalidAuthority
     )]
     pub authority: Signer<'info>,
     #[account(
@@ -59,13 +55,10 @@ pub fn handle_initialize_governance(
             context.bumps.governance,
             GlobalGovernancePolicy {
                 authorities: args.authorities,
-                increase_delays: args.increase_delays,
-                decrease_delays: args.decrease_delays,
-                creation_delay_seconds: args.creation_delay_seconds,
-                proposal_expiry_seconds: args.proposal_expiry_seconds,
                 subaccount_creation_fee_lamports: args.subaccount_creation_fee_lamports,
                 subaccount_creation_fee_destination: args.subaccount_creation_fee_destination,
             },
         )?;
+
     Ok(())
 }

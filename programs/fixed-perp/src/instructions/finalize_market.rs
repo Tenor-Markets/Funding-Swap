@@ -16,6 +16,7 @@ pub struct FinalizeMarkets {}
 
 pub fn handle_finalize_market<'info>(context: Context<'info, FinalizeMarket<'info>>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
+
     finalize_one_market(&context.accounts.market, context.remaining_accounts, now)
 }
 
@@ -25,6 +26,7 @@ fn ensure_finalization_ready(market: &MarketState, now: i64) -> Result<()> {
     {
         return Err(error!(StateError::InvalidStatus));
     }
+
     Ok(())
 }
 
@@ -35,7 +37,9 @@ fn finalize_one_market<'info>(
 ) -> Result<()> {
     let (collateral_key, settlement_key, underlying_key) = {
         let market_view = market_loader.load()?;
+
         ensure_finalization_ready(&market_view, now)?;
+
         (
             market_view.config.collateral_state,
             market_view.config.settlement_state,
@@ -45,15 +49,21 @@ fn finalize_one_market<'info>(
 
     let (underlying_asset, remaining) =
         read_asset_observation(remaining_accounts, underlying_key, now)?;
+
     let (collateral_asset, remaining) = read_asset_observation(remaining, collateral_key, now)?;
+
     let (settlement_asset, _) = read_asset_observation(remaining, settlement_key, now)?;
 
     let ratio = settlement_ratio(&collateral_asset, &settlement_asset)?;
+
     let index_price = underlying_settlement_price(&underlying_asset, &settlement_asset)?;
+
     let mut market = market_loader.load_mut()?;
     let maturity = market.config.maturity_timestamp;
+
     market.advance_fee_index_with_price(maturity, index_price)?;
     market.freeze_settlement_ratio(ratio, now)?;
+
     Ok(())
 }
 
@@ -66,13 +76,16 @@ pub fn handle_finalize_markets<'info>(context: Context<'info, FinalizeMarkets>) 
     while let Some(market_info) = remaining.first() {
         let loader = AccountLoader::<MarketState>::try_from(market_info)
             .map_err(|_| error!(StateError::InvalidMarket))?;
+
         remaining = &remaining[1..];
 
         let (collateral_key, settlement_key, underlying_key) = {
             let market = loader
                 .load()
                 .map_err(|_| error!(StateError::InvalidMarket))?;
+
             ensure_finalization_ready(&market, now)?;
+
             (
                 market.config.collateral_state,
                 market.config.settlement_state,
@@ -86,14 +99,18 @@ pub fn handle_finalize_markets<'info>(context: Context<'info, FinalizeMarkets>) 
             read_asset_observation(remaining_after_underlying, collateral_key, now)?;
         let (settlement, rest) =
             read_asset_observation(remaining_after_collateral, settlement_key, now)?;
+
         remaining = rest;
+
         let ratio = settlement_ratio(&collateral, &settlement)?;
         let index_price = underlying_settlement_price(&underlying, &settlement)?;
 
         let mut market = loader.load_mut()?;
         let maturity = market.config.maturity_timestamp;
+
         market.advance_fee_index_with_price(maturity, index_price)?;
         market.freeze_settlement_ratio(ratio, now)?;
     }
+
     Ok(())
 }

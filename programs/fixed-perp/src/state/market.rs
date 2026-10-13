@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::ops::SubAssign;
+
 use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use fixed::types::I64F64;
@@ -149,7 +152,6 @@ pub struct MarginGroup {
     pub _pad_0: [u8; 4],
     pub collateral_state: Pubkey,
     pub settlement_state: Pubkey,
-    pub governance_key: Pubkey,
     pub critical_health_ratio: FixedPoint,
     pub risky_order_cancellation_ratio: FixedPoint,
     pub market_count: u32,
@@ -171,10 +173,6 @@ impl MarginGroup {
 
     pub fn is_same_collateral_state(&self, state: Pubkey) -> bool {
         self.collateral_state == state
-    }
-
-    pub fn is_governance_key(&self, key: Pubkey) -> bool {
-        self.governance_key == key
     }
 
     /// Records one newly created subaccount after the instruction validates its group binding.
@@ -219,56 +217,6 @@ impl MarginGroup {
 #[account]
 #[derive(Debug, Default)]
 pub struct MarketGroupMembership {}
-
-/// Rent-bearing delayed proposal for one group/market membership. The active
-/// membership remains the discriminator-only PDA above.
-#[account]
-#[derive(Debug, InitSpace)]
-pub struct PendingMarketGroupMembership {
-    pub margin_group: Pubkey,
-    pub market: Pubkey,
-    pub rent_recipient: Pubkey,
-    pub window: super::ProposalWindow,
-}
-
-impl PendingMarketGroupMembership {
-    pub const SPACE: usize = 8 + Self::INIT_SPACE;
-
-    /// Initializes a delayed market/group membership proposal.
-    pub fn initialize_in_place(
-        &mut self,
-        margin_group: Pubkey,
-        market: Pubkey,
-        rent_recipient: Pubkey,
-        window: super::ProposalWindow,
-    ) -> StateResult<()> {
-        if margin_group == Pubkey::default()
-            || market == Pubkey::default()
-            || rent_recipient == Pubkey::default()
-        {
-            return Err(StateError::InvalidConfiguration);
-        }
-
-        self.margin_group = margin_group;
-        self.market = market;
-        self.rent_recipient = rent_recipient;
-        self.window = window;
-
-        Ok(())
-    }
-
-    pub fn is_same_margin_group(&self, key: Pubkey) -> bool {
-        self.margin_group == key
-    }
-
-    pub fn is_same_market(&self, key: Pubkey) -> bool {
-        self.market == key
-    }
-
-    pub fn is_same_rent_recipient(&self, key: Pubkey) -> bool {
-        self.rent_recipient == key
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
@@ -346,11 +294,10 @@ pub struct MarketConfig {
     pub liquidation_base_incentive: FixedPoint,
     pub liquidation_incentive_slope: FixedPoint,
     pub liquidation_fee_rate: FixedPoint,
-    pub market_id: u32,
+    pub market_id: u64,
     pub mark_observation_window_seconds: u32,
     pub margin_time_threshold_seconds: u32,
     pub pm_cache_nonce: u32,
-    pub _pad_1: [u8; 4],
     /// Implicit decimal exponent for all market rate/index mantissas.
     pub tick_scale: u8,
     /// AssetState decimal metadata for position/order/OI underlying atoms.
@@ -383,25 +330,18 @@ pub struct MarketState {
     pub pending_maker_oi_reserve: u128,
     pub accrued_protocol_fee_atoms: u128,
     pub position_factors: ValuationFactors,
-    pub bump: u8,
     pub status: MarketStatus,
     pub source_seeded: u8,
-    pub _pad_0: [u8; 1],
+    pub _pad_0: [u8; 2],
     pub subaccount_count: u32,
     /// Authenticated collateral-per-settlement ratio frozen at maturity.
     pub frozen_settlement_ratio: SettlementRatio,
     /// Timestamp at which the settlement ratio was frozen.
     pub finalized_at_timestamp: i64,
     pub reserved: [u8; MARKET_STATE_RESERVED],
-    /// Resource-local governance account bound at market creation.
-    pub governance_key: Pubkey,
 }
 
 impl MarketState {
-    pub fn is_governance_key(&self, key: Pubkey) -> bool {
-        self.governance_key == key
-    }
-
     /// Reads the authenticated collateral-per-settlement ratio frozen at
     /// maturity.
     pub fn frozen_settlement_ratio(&self) -> Option<SettlementRatio> {
@@ -470,6 +410,18 @@ impl MarketState {
         self.status.0 == MARKET_CLOSE_ONLY
     }
 
+    pub fn may_use_order(&self) -> bool {
+        self.is_active() || self.is_close_only()
+    }
+
+    pub fn may_refresh(&self) -> bool {
+        !self.is_pending() && !self.is_matured()
+    }
+
+    pub fn may_seed_source(&self) -> bool {
+        self.is_pending() && !self.is_seeded()
+    }
+
     /// Returns whether maturity finalization has completed for this market.
     pub fn is_matured(&self) -> bool {
         self.status.0 == MARKET_MATURED
@@ -514,43 +466,20 @@ impl MarketState {
     /// collateral atoms those fees entitle the protocol to withdraw.
     /// Nothing is changed if any market is ineligible or the total is zero.
     pub fn take_matured_protocol_fees(
-        asset: Pubkey,
         markets: &mut [&mut Self],
     ) -> StateResult<u64> {
-        if markets.is_empty() {
-            return Err(StateError::InvalidConfiguration);
-        }
 
         let mut total = 0u128;
 
-        for (index, market) in markets.iter().enumerate() {
-            if market.config.collateral_state != asset {
-                return Err(StateError::InvalidKey);
-            }
-
-            let market_id = market.config.market_id;
-
-            if markets[..index]
-                .iter()
-                .any(|earlier| earlier.config.market_id == market_id)
-            {
-                return Err(StateError::InvalidRemainingAccounts);
-            }
-
+        for market in markets.iter_mut() {
             total = total
                 .checked_add(market.accrued_fee_collateral_atoms()?)
                 .ok_or(StateError::ArithmeticOverflow)?;
-        }
 
-        if total == 0 {
-            return Err(StateError::InvalidConfiguration);
+            market.accrued_protocol_fee_atoms = 0;        
         }
 
         let amount = u64::try_from(total).map_err(|_| StateError::ArithmeticOverflow)?;
-
-        for market in markets.iter_mut() {
-            market.accrued_protocol_fee_atoms = 0;
-        }
 
         Ok(amount)
     }
@@ -575,7 +504,9 @@ impl MarketState {
         if !self.is_active() && !self.is_close_only() {
             return Err(StateError::InvalidStatus);
         }
+
         let ratio = health_ratio.to_i64f64();
+
         if ratio < I64F64::ZERO || ratio >= I64F64::ONE {
             return Err(StateError::InvalidStatus);
         }
@@ -1105,6 +1036,7 @@ impl VenueAdapterConfig {
         if self.kind.0 != ADAPTER_JUPITER {
             return Err(StateError::InvalidTag);
         }
+
         bytemuck::try_from_bytes(
             &bytemuck::bytes_of(&self.payload)[..core::mem::size_of::<JupiterAdapterPayload>()],
         )
@@ -1116,6 +1048,7 @@ impl VenueAdapterConfig {
         if self.kind.0 != ADAPTER_JUPITER {
             return Err(StateError::InvalidTag);
         }
+
         bytemuck::try_from_bytes_mut(
             &mut bytemuck::bytes_of_mut(&mut self.payload)
                 [..core::mem::size_of::<JupiterAdapterPayload>()],
@@ -1128,6 +1061,7 @@ impl VenueAdapterConfig {
         if self.kind.0 != ADAPTER_PHOENIX {
             return Err(StateError::InvalidTag);
         }
+
         bytemuck::try_from_bytes(bytemuck::bytes_of(&self.payload))
             .map_err(|_| StateError::InvalidConfiguration)
     }
@@ -1137,6 +1071,7 @@ impl VenueAdapterConfig {
         if self.kind.0 != ADAPTER_PHOENIX {
             return Err(StateError::InvalidTag);
         }
+
         bytemuck::try_from_bytes_mut(bytemuck::bytes_of_mut(&mut self.payload))
             .map_err(|_| StateError::InvalidConfiguration)
     }
@@ -1145,6 +1080,7 @@ impl VenueAdapterConfig {
     fn zero_opaque_bytes(&mut self) -> StateResult<()> {
         self._pad_0 = [0; 15];
         self.reserved = [0; VENUE_CONFIG_RESERVED];
+
         match self.kind.0 {
             ADAPTER_JUPITER => {
                 let payload = self.jupiter_mut()?;
@@ -1162,6 +1098,7 @@ impl VenueAdapterConfig {
             }
             _ => return Err(StateError::InvalidTag),
         }
+
         Ok(())
     }
 
@@ -1197,6 +1134,7 @@ impl VenueAdapterConfig {
             }
             _ => return Err(StateError::InvalidTag),
         }
+
         Ok(())
     }
 }
@@ -1226,7 +1164,7 @@ impl MarketConfig {
         liquidation_base_incentive: FixedPoint,
         liquidation_incentive_slope: FixedPoint,
         liquidation_fee_rate: FixedPoint,
-        market_id: u32,
+        market_id: u64,
         mark_observation_window_seconds: u32,
         margin_time_threshold_seconds: u32,
         tick_scale: u8,
@@ -1267,7 +1205,6 @@ impl MarketConfig {
     /// Clears all configuration padding before the configuration is persisted.
     fn zero_opaque_bytes(&mut self) -> StateResult<()> {
         self._pad_0 = [0; 16];
-        self._pad_1 = [0; 4];
         self.reserved = [0; MARKET_CONFIG_RESERVED];
         self._pad_2 = [0; 12];
         self._pad_3 = [0; 12];
@@ -1283,6 +1220,7 @@ impl MarketConfig {
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         if self.market_id == 0
             || self.start_timestamp < 0
             || self.maturity_timestamp <= 0
@@ -1301,6 +1239,7 @@ impl MarketConfig {
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         let nonnegative = [
             self.rate_floor,
             self.initial_margin_factor,
@@ -1314,12 +1253,14 @@ impl MarketConfig {
             self.liquidation_incentive_slope,
             self.liquidation_fee_rate,
         ];
+
         if nonnegative.iter().any(|factor| factor.to_raw_bits() < 0)
             || self.initial_margin_factor.to_raw_bits()
                 < self.maintenance_margin_factor.to_raw_bits()
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         self.adapter.validate()
     }
 
@@ -1341,33 +1282,31 @@ impl MarketConfig {
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         Ok(())
+    }
+
+    pub fn is_same_collateral_state(&self, state: Pubkey) -> bool {
+        self.collateral_state == state
     }
 }
 
 impl MarketState {
-    #[allow(clippy::too_many_arguments)]
     /// Initializes a fresh market and its embedded book from validated configuration.
     pub fn initialize_in_place(
         &mut self,
-        bump: u8,
         mut config: MarketConfig,
         now: i64,
         tick_step: u8,
         minimum_order_size_atoms: u64,
         maximum_order_size_atoms: u64,
         maximum_open_orders_per_subaccount: u8,
-        governance_key: Pubkey,
     ) -> StateResult<()> {
         config.zero_opaque_bytes()?;
         config.validate()?;
 
         if now < 0 {
             return Err(StateError::InvalidClock);
-        }
-
-        if governance_key == Pubkey::default() {
-            return Err(StateError::InvalidConfiguration);
         }
 
         self.order_book.initialize_in_place(
@@ -1397,37 +1336,28 @@ impl MarketState {
         self.materialized_gross_open_interest = 0;
         self.pending_maker_oi_reserve = 0;
         self.accrued_protocol_fee_atoms = 0;
-        self.bump = bump;
         self.status = super::MarketStatus(MARKET_PENDING);
         self.source_seeded = 0;
-        self._pad_0 = [0; 1];
+        self._pad_0 = [0; 2];
         self.subaccount_count = 0;
         self.frozen_settlement_ratio = SettlementRatio::zeroed();
         self.finalized_at_timestamp = 0;
         self.reserved = [0; MARKET_STATE_RESERVED];
-        self.governance_key = governance_key;
 
         Ok(())
     }
 
-    /// Activates a pending market inside its coordinator-supplied window.
-    pub fn activate(
-        &mut self,
-        activation_window: &mut super::ProposalWindow,
-        now: i64,
-    ) -> StateResult<()> {
-        if self.status.0 != MARKET_PENDING || self.source_seeded != 1 {
-            return Err(StateError::InvalidStatus);
-        }
-
-        if now >= self.config.start_timestamp {
-            return Err(StateError::Conflict);
-        }
-
-        activation_window.consume(now)?;
+    /// Activates a seeded market before its configured start time.
+    pub fn activate(&mut self) {
         self.status = super::MarketStatus(MARKET_ACTIVE);
+    }
 
-        Ok(())
+    pub fn is_seeded(&self) -> bool {
+        self.source_seeded == 1
+    }
+
+    pub fn can_start(&self, now: i64) -> bool {
+        now < self.config.start_timestamp
     }
 
     /// Returns the mark interpolated from the prior target over the configured observation window.
@@ -1470,44 +1400,56 @@ impl MarketState {
             tick_scale: self.config.tick_scale,
         }
     }
-//
+
     /// Advances fees with a freshly authenticated underlying/settlement price
     /// supplied by the caller's AssetState/Pyth pair.
     pub fn advance_fee_index_with_price(&mut self, now: i64, price: FixedPoint) -> StateResult<()> {
         if now < self.protocol_checkpoint_timestamp {
             return Err(StateError::InvalidClock);
         }
+
         let elapsed = now
             .checked_sub(self.protocol_checkpoint_timestamp)
             .ok_or(StateError::InvalidClock)?;
+
         if elapsed == 0 {
             self.protocol_checkpoint_timestamp = now;
+
             return Ok(());
         }
+
         if price.to_raw_bits() <= 0 {
             return Err(StateError::InvalidConfiguration);
         }
+
         let fee_rate = fixed::types::I64F64::from_bits(
             self.config.annualized_settlement_fee_rate.to_raw_bits(),
         );
+
         let elapsed = fixed::types::I64F64::checked_from_num(elapsed)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let year = fixed::types::I64F64::checked_from_num(SECONDS_PER_YEAR)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let market_scale = decimal_scale(self.config.tick_scale)?;
+
         let delta = fee_rate
-            .checked_mul(price.to_i64f64())
+            .checked_mul(market_scale)
+            .and_then(|value| value.checked_mul(price.to_i64f64()))
             .and_then(|value| value.checked_mul(elapsed))
-            .and_then(|value| value.checked_mul(market_scale))
             .and_then(|value| value.checked_div(year))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let next = self
             .fee_index
             .to_i64f64()
             .checked_add(delta)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         self.fee_index = FixedPoint::from_raw_bits(next.to_bits());
         self.protocol_checkpoint_timestamp = now;
+
         Ok(())
     }
 
@@ -1524,6 +1466,7 @@ impl MarketState {
             .to_i64f64()
             .checked_mul(price.to_i64f64())
             .ok_or(StateError::ArithmeticOverflow)?;
+
         self.apply_weighted_rate_observation_with_price(
             RateDelta::from_i64f64(weighted_delta),
             source_checkpoint,
@@ -1543,29 +1486,23 @@ impl MarketState {
         now: i64,
         price: FixedPoint,
     ) -> StateResult<()> {
-        if self.source_seeded != 1 {
-            return Err(StateError::InvalidStatus);
-        }
-        if now < self.protocol_checkpoint_timestamp
-            || source_last_update_timestamp < 0
-            || source_last_update_timestamp > now
-            || checkpoint_epoch < self.checkpoint_epoch
-        {
-            return Err(StateError::InvalidClock);
-        }
         let market_scale = decimal_scale(self.config.tick_scale)?;
+
         let scaled_delta = weighted_delta
             .to_i64f64()
             .checked_mul(market_scale)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let next_floating_index = self
             .floating_index
             .to_i64f64()
             .checked_add(scaled_delta)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         // Protocol fees stop at the market's maturity boundary even when a
         // due refresh is submitted late.
         let fee_now = now.min(self.config.maturity_timestamp);
+
         if fee_now >= self.protocol_checkpoint_timestamp {
             self.advance_fee_index_with_price(fee_now, price)?;
         }
@@ -1575,6 +1512,7 @@ impl MarketState {
         self.source_last_update_timestamp = source_last_update_timestamp;
         self.protocol_checkpoint_timestamp = now;
         self.checkpoint_epoch = checkpoint_epoch;
+
         Ok(())
     }
 
@@ -1586,20 +1524,12 @@ impl MarketState {
         checkpoint_epoch: u64,
         now: i64,
     ) -> StateResult<()> {
-        if self.status.0 != MARKET_PENDING || self.source_seeded != 0 {
-            return Err(StateError::InvalidStatus);
-        }
-        if now < self.epoch_origin_timestamp
-            || source_last_update_timestamp < 0
-            || source_last_update_timestamp > now
-        {
-            return Err(StateError::InvalidClock);
-        }
         self.source_native_checkpoint = source_checkpoint;
         self.source_last_update_timestamp = source_last_update_timestamp;
         self.protocol_checkpoint_timestamp = now;
         self.checkpoint_epoch = checkpoint_epoch;
         self.source_seeded = 1;
+
         Ok(())
     }
 
@@ -1613,13 +1543,13 @@ impl MarketState {
         current_mark: FixedPoint,
     ) -> StateResult<()> {
         self.order_book.validate_order_size(size)?;
-        if now >= self.config.maturity_timestamp
-            || !(self.is_active() || self.is_close_only())
-            || (expiry_timestamp != 0
-                && (expiry_timestamp <= now || expiry_timestamp > self.config.maturity_timestamp))
+
+        if expiry_timestamp != 0
+                && (expiry_timestamp <= now || expiry_timestamp > self.config.maturity_timestamp)
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         if !self.rate_within_bound(
             self.rate_at_tick(limit_tick)?.to_fixed_point(),
             current_mark,
@@ -1627,21 +1557,20 @@ impl MarketState {
         )? {
             return Err(StateError::Conflict);
         }
+
         Ok(())
     }
 
     /// Returns whether an action would cross the current best maker price.
-    fn order_crosses(&self, side: Side, limit_tick: i16) -> StateResult<bool> {
+    fn order_crosses(&self, side: Side, limit_tick: i16) -> bool {
         let maker_side = match side {
             Side::Long => Side::Short,
             Side::Short => Side::Long,
         };
 
-        match self.order_book.best_tick(maker_side) {
-            Ok(tick) => Ok(Self::tick_is_matchable(side, limit_tick, tick)),
-            Err(StateError::NotFound) => Ok(false),
-            Err(error) => Err(error),
-        }
+        self.order_book
+            .best_tick(maker_side)
+            .is_some_and(|tick| Self::tick_is_matchable(side, limit_tick, tick))
     }
 
     /// Matches one validated action while accumulating batch-wide payment and fee totals.
@@ -1659,34 +1588,41 @@ impl MarketState {
         totals: &mut MatchTotals,
     ) -> StateResult<PlaceOrderResult> {
         let side = Side::from_size(size)?;
+
         let maker_side = match side {
             Side::Long => Side::Short,
             Side::Short => Side::Long,
         };
+
         let start_fixed = totals.fixed_payment_atoms;
         let start_fee = totals.taker_fee_atoms;
         let mut remaining = size;
+
         // To do: We can and should optimize this loop to tread along orders with the same tick and call
         // `best_head` again when we have exhausted all orders at that tick.
         while remaining != 0 {
-            let node_index = match self.order_book.best_head(maker_side) {
-                Ok(index) => index,
-                Err(StateError::NotFound) => break,
-                Err(error) => return Err(error),
+            let Some(node_index) = self.order_book.best_head(maker_side)? else {
+                break;
             };
+
             let (maker_subaccount, maker_remaining_size, maker_tick) = {
                 let node = &self.order_book.nodes[node_index];
                 (node.maker_subaccount, node.remaining_size, node.tick)
             };
+
             if !Self::tick_is_matchable(side, limit_tick, maker_tick) {
                 break;
             }
+
             if maker_subaccount == taker_key {
                 return Err(StateError::Conflict);
             }
+
             let candidate = remaining
                 .unsigned_abs()
                 .min(maker_remaining_size.unsigned_abs());
+
+            // TODO: Get this to return the info we use below, so we don't recompute it.
             let fill_abs = self.affordable_fill_size(
                 candidate,
                 maker_side,
@@ -1695,13 +1631,17 @@ impl MarketState {
                 maximum_payment_atoms,
                 totals,
             )?;
+
             if fill_abs == 0 {
                 break;
             }
+
             let maker_fill = Self::signed_amount(fill_abs, maker_side)?;
+
             let taker_fill = maker_fill
                 .checked_neg()
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             if self.is_close_only() {
                 self.check_close_only_fill(
                     taker,
@@ -1712,16 +1652,21 @@ impl MarketState {
                     close_only_makers,
                 )?;
             }
+
             let payment = self.fixed_payment_atoms(maker_fill, maker_tick, time_to_maturity)?;
+
             let next_fixed = totals
                 .fixed_payment_atoms
                 .checked_add(payment)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let next_filled = totals
                 .filled_size
                 .checked_add(fill_abs)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let next_fee = self.taker_fee_atoms(next_filled, time_to_maturity)?;
+
             self.apply_maker_match_and_taker_fill(
                 taker,
                 taker_slot,
@@ -1732,6 +1677,7 @@ impl MarketState {
                     .checked_sub(totals.taker_fee_atoms)
                     .ok_or(StateError::ArithmeticOverflow)?,
             )?;
+
             totals.filled_size = next_filled;
             totals.fixed_payment_atoms = next_fixed;
             totals.taker_fee_atoms = next_fee;
@@ -1740,6 +1686,7 @@ impl MarketState {
                 .checked_sub(taker_fill)
                 .ok_or(StateError::ArithmeticOverflow)?;
         }
+
         Ok(PlaceOrderResult {
             filled_size: size
                 .checked_sub(remaining)
@@ -1770,6 +1717,7 @@ impl MarketState {
     ) -> StateResult<PlaceOrderResult> {
         order_intent.time_in_force.validate()?;
         let current_mark = self.current_mark_rate(now)?;
+
         self.validate_place_order_input(
             now,
             order_intent.size,
@@ -1777,16 +1725,19 @@ impl MarketState {
             order_intent.expiry_timestamp,
             current_mark,
         )?;
+
         let side = Side::from_size(order_intent.size)?;
+
         // Post-only crossing checks do not require a subaccount slot.  Run
         // them before `ensure_market` so a rejected or skipped order cannot
         // leave an empty slot behind.
         if order_intent.time_in_force.is_post_only()
-            && self.order_crosses(side, order_intent.limit_tick)?
+            && self.order_crosses(side, order_intent.limit_tick)
         {
             if order_intent.time_in_force.rejects_crossing() {
                 return Err(StateError::Conflict);
             }
+
             if order_intent.time_in_force.skips_crossing() {
                 return Ok(PlaceOrderResult {
                     remaining_size: order_intent.size,
@@ -1794,15 +1745,19 @@ impl MarketState {
                 });
             }
         }
+
         // Create the slot only after every input gate above succeeds. A
         // rejected order must not increment the market's subaccount count.
         let taker_market_slot = taker.ensure_market(self)?;
+
         let time_to_maturity = self
             .config
             .maturity_timestamp
             .checked_sub(now)
             .ok_or(StateError::InvalidClock)?;
+
         let mut totals = MatchTotals::default();
+
         let mut result = if order_intent.time_in_force.is_post_only() {
             PlaceOrderResult {
                 remaining_size: order_intent.size,
@@ -1821,16 +1776,19 @@ impl MarketState {
                 &mut totals,
             )?
         };
+
         if let Some(tick) = totals.last_matched_tick {
             self.validate_final_position_size(taker, taker_market_slot)?;
             self.update_mark_after_fill(now, tick)?;
         }
+
         if order_intent.time_in_force.is_fill_or_kill() && result.remaining_size != 0 {
             return Err(StateError::NotFound);
         }
+
         if result.remaining_size != 0
             && order_intent.time_in_force.rests_remainder()
-            && !self.order_crosses(side, order_intent.limit_tick)?
+            && !self.order_crosses(side, order_intent.limit_tick)
         {
             result.resting_order = Some(self.rest_order(
                 taker,
@@ -1844,6 +1802,7 @@ impl MarketState {
                 },
             )?);
         }
+
         Ok(result)
     }
 
@@ -1866,12 +1825,15 @@ impl MarketState {
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         let current_mark = self.current_mark_rate(now)?;
+
         let time_to_maturity = self
             .config
             .maturity_timestamp
             .checked_sub(now)
             .ok_or(StateError::InvalidClock)?;
+
         for order in intent.orders {
             self.validate_place_order_input(
                 now,
@@ -1881,18 +1843,23 @@ impl MarketState {
                 current_mark,
             )?;
         }
+
         // As in the single-order path, defer slot allocation until the whole
         // batch has passed validation.
         let taker_slot = taker.ensure_market(self)?;
+
         let mut totals = MatchTotals::default();
+
         for (order, result) in intent.orders.iter().zip(results.iter_mut()) {
             let size = Self::signed_amount(order.size, intent.side)?;
+
             *result = if intent.time_in_force.is_post_only() {
-                if self.order_crosses(intent.side, order.limit_tick)?
+                if self.order_crosses(intent.side, order.limit_tick)
                     && intent.time_in_force.rejects_crossing()
                 {
                     return Err(StateError::Conflict);
                 }
+
                 PlaceOrderResult {
                     remaining_size: size,
                     ..PlaceOrderResult::default()
@@ -1911,19 +1878,22 @@ impl MarketState {
                 )?
             };
         }
+
         if let Some(tick) = totals.last_matched_tick {
             self.validate_final_position_size(taker, taker_slot)?;
             self.update_mark_after_fill(now, tick)?;
         }
+
         if intent.time_in_force.is_fill_or_kill()
             && results.iter().any(|result| result.remaining_size != 0)
         {
             return Err(StateError::NotFound);
         }
+
         for (order, result) in intent.orders.iter().zip(results.iter_mut()) {
             if result.remaining_size != 0
                 && intent.time_in_force.rests_remainder()
-                && !self.order_crosses(intent.side, order.limit_tick)?
+                && !self.order_crosses(intent.side, order.limit_tick)
             {
                 result.resting_order = Some(self.rest_order(
                     taker,
@@ -1938,6 +1908,7 @@ impl MarketState {
                 )?);
             }
         }
+
         Ok(())
     }
 
@@ -1952,11 +1923,14 @@ impl MarketState {
             if usize::from(reference.slot_index) != slot_index {
                 continue;
             }
+
             let node = &self.order_book.nodes[usize::from(reference.node_index)];
+
             if node.tick == tick {
                 return Some(index);
             }
         }
+
         None
     }
 
@@ -1970,6 +1944,7 @@ impl MarketState {
     ) -> StateResult<OrderId> {
         // A valid submitted size can leave a remainder below the resting-order minimum.
         self.order_book.validate_order_size(order.size)?;
+
         if self
             .find_order_ref_at_tick(subaccount, slot_index, order.tick)
             .is_some()
@@ -1983,13 +1958,17 @@ impl MarketState {
             .iter()
             .filter(|reference| usize::from(reference.slot_index) == slot_index)
             .count();
+
         if usize::from(subaccount.order_ref_count) >= super::MAX_ORDERS
             || market_order_count >= usize::from(self.order_book.maximum_open_orders_per_subaccount)
         {
             return Err(StateError::CapacityExhausted);
         }
+
         let rate = self.rate_at_tick(order.tick)?.to_fixed_point();
+
         let mut next_risk = subaccount.markets[slot_index].order_risk;
+
         next_risk.add(
             Side::from_size(order.size)?,
             order.size.unsigned_abs(),
@@ -1997,6 +1976,7 @@ impl MarketState {
             self.config.rate_floor,
             self.order_risk_scale(),
         )?;
+
         // TODO: It would be better to check this only once when on the close batch path.
         if self.is_close_only()
             && !(aggregate_is_closing_action(
@@ -2009,6 +1989,7 @@ impl MarketState {
         {
             return Err(StateError::Conflict);
         }
+
         let order_id = self.order_book.add_order(
             subaccount_key,
             order.size,
@@ -2016,8 +1997,10 @@ impl MarketState {
             order.time_in_force,
             order.expiry_timestamp,
         )?;
+
         subaccount.markets[slot_index].order_risk = next_risk;
         subaccount.add_order_ref(OrderRef::new(slot_index, order_id.slab_index as usize));
+
         Ok(order_id)
     }
 
@@ -2036,15 +2019,18 @@ impl MarketState {
         if order_id.slab_index >= BOOK_CAPACITY as u64 {
             return None;
         }
+
         subaccount
             .iter_order_refs()
             .iter()
             .enumerate()
             .find_map(|(index, reference)| {
                 let node_index = usize::from(reference.node_index);
+
                 let owned_here = usize::from(reference.slot_index) == slot_index
                     && u64::from(reference.node_index) == order_id.slab_index
                     && self.order_book.nodes[node_index].sequence == order_id.sequence;
+
                 owned_here.then_some(index)
             })
     }
@@ -2078,6 +2064,7 @@ impl MarketState {
         ref_index: usize,
     ) -> StateResult<()> {
         let node_index = usize::from(subaccount.order_refs[ref_index].node_index);
+
         let (pending_size, remaining_size, tick, side) = {
             let node = &self.order_book.nodes[node_index];
             (
@@ -2087,8 +2074,11 @@ impl MarketState {
                 node.get_side(),
             )
         };
+
         let rate = self.rate_at_tick(tick)?.to_fixed_point();
+
         let mut next_risk = subaccount.markets[slot_index].order_risk;
+
         next_risk.subtract(
             side,
             remaining_size.unsigned_abs(),
@@ -2096,15 +2086,20 @@ impl MarketState {
             self.config.rate_floor,
             self.order_risk_scale(),
         )?;
+
         if pending_size == 0 {
             self.order_book.close_order(node_index)?;
+
             subaccount.remove_order_ref(ref_index);
         } else if remaining_size != 0 {
             self.order_book.detach_from_fifo(node_index)?;
+
             self.order_book
                 .set_order_sizes(node_index, pending_size, 0)?;
         }
+
         subaccount.markets[slot_index].order_risk = next_risk;
+
         Ok(())
     }
 
@@ -2126,17 +2121,23 @@ impl MarketState {
         if new_size == 0 {
             return self.close_order(subaccount, order_id);
         }
+
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
             .ok_or(StateError::NotFound)?;
+
         let Some(ref_index) = self.find_order_ref_by_id(subaccount, slot_index, order_id) else {
             return Err(StateError::NotFound);
         };
+
         let node_index = usize::from(subaccount.order_refs[ref_index].node_index);
+
         let (remaining_size, tick, side) = {
             let node = &self.order_book.nodes[node_index];
+
             (node.remaining_size, node.tick, node.get_side())
         };
+
         if self.order_book.nodes[node_index].has_pending_fill() {
             return Err(StateError::Conflict);
         }
@@ -2145,18 +2146,26 @@ impl MarketState {
         if new_size.signum() != remaining_size.signum() {
             return Err(StateError::InvalidConfiguration);
         }
+
         let old_size = remaining_size.unsigned_abs();
         let new_size_abs = new_size.unsigned_abs();
+
         if new_size_abs == old_size {
             return Ok(());
         }
+
         let increases = new_size_abs > old_size;
+
         if increases && !(self.is_active() || self.is_close_only()) {
             return Err(StateError::InvalidStatus);
         }
+
         self.order_book.validate_order_size(new_size)?;
+
         let rate = self.rate_at_tick(tick)?.to_fixed_point();
+
         let mut next_risk = subaccount.markets[slot_index].order_risk;
+
         if increases {
             next_risk.add(
                 side,
@@ -2178,6 +2187,7 @@ impl MarketState {
                 self.order_risk_scale(),
             )?;
         }
+
         if self.is_close_only()
             && !(aggregate_is_closing_action(
                 subaccount.markets[slot_index].position_size,
@@ -2189,9 +2199,12 @@ impl MarketState {
         {
             return Err(StateError::Conflict);
         }
+
         self.order_book
             .set_order_sizes(node_index, new_size, new_size)?;
+
         subaccount.markets[slot_index].order_risk = next_risk;
+
         Ok(())
     }
 
@@ -2205,9 +2218,11 @@ impl MarketState {
         if changes.len() > super::MAX_ORDERS {
             return Err(StateError::InvalidConfiguration);
         }
+
         for change in changes {
             self.modify_order(subaccount, change.order_id, change.new_size)?;
         }
+
         Ok(())
     }
 
@@ -2221,9 +2236,11 @@ impl MarketState {
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
             .ok_or(StateError::NotFound)?;
+
         let Some(ref_index) = self.find_order_ref_by_id(subaccount, slot_index, order_id) else {
             return Err(StateError::NotFound);
         };
+
         self.cancel_order_ref(subaccount, slot_index, ref_index)
     }
 
@@ -2237,10 +2254,11 @@ impl MarketState {
         if orders.len() > super::MAX_ORDERS {
             return Err(StateError::InvalidConfiguration);
         }
+
         for order_id in orders {
-            // To do: Rather than repeatedly multiplying along the cancel_order_ref path, we can instead
+            // TODO: Rather than repeatedly multiplying along the cancel_order_ref path, we can instead
             // choose to just sum up the sizes and update the risk after.
-            // We can probably do that more generally for variants with more that one order to cancel, even in
+            // We can probably do that more generally for variants with more than one order to cancel, even in
             // in the single case as well.
             // We can also extend the idea to place and modify as well.
             self.close_order(subaccount, *order_id)?;
@@ -2260,13 +2278,15 @@ impl MarketState {
         if slot_index >= subaccount.markets.len() {
             return Err(StateError::InvalidReference);
         }
-        let mut ref_index = usize::from(subaccount.order_ref_count);
-        while ref_index > 0 {
-            ref_index -= 1;
-            if usize::from(subaccount.order_refs[ref_index].slot_index) == slot_index {
-                self.cancel_order_ref(subaccount, slot_index, ref_index)?;
+
+        let ref_index = usize::from(subaccount.order_ref_count);
+
+        for index in (0..ref_index).rev() {
+            if usize::from(subaccount.order_refs[index].slot_index) == slot_index {
+                self.cancel_order_ref(subaccount, slot_index, index)?;
             }
         }
+
         Ok(())
     }
 
@@ -2287,23 +2307,28 @@ impl MarketState {
         if minimum_tick > maximum_tick {
             return Err(StateError::InvalidConfiguration);
         }
+
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
             .ok_or(StateError::NotFound)?;
-        let mut ref_index = usize::from(subaccount.order_ref_count);
-        while ref_index > 0 {
-            ref_index -= 1;
-            if usize::from(subaccount.order_refs[ref_index].slot_index) == slot_index {
-                let node_index = usize::from(subaccount.order_refs[ref_index].node_index);
+
+        let ref_index = usize::from(subaccount.order_ref_count);
+
+        for index in (0..ref_index).rev() {
+            if usize::from(subaccount.order_refs[index].slot_index) == slot_index {
+                let node_index = usize::from(subaccount.order_refs[index].node_index);
+
                 let out_of_bounds = {
                     let node = &self.order_book.nodes[node_index];
                     node.tick < minimum_tick || node.tick > maximum_tick
                 };
+
                 if out_of_bounds {
-                    self.cancel_order_ref(subaccount, slot_index, ref_index)?;
+                    self.cancel_order_ref(subaccount, slot_index, index)?;
                 }
             }
         }
+
         Ok(())
     }
 
@@ -2316,19 +2341,26 @@ impl MarketState {
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
             .ok_or(StateError::NotFound)?;
+
         let position = self.projected_position(subaccount, slot_index)?;
-        let mut ref_index = usize::from(subaccount.order_ref_count);
-        while ref_index > 0 {
-            ref_index -= 1;
-            if usize::from(subaccount.order_refs[ref_index].slot_index) == slot_index {
-                let node_index = usize::from(subaccount.order_refs[ref_index].node_index);
+
+        let ref_index = usize::from(subaccount.order_ref_count);
+
+        for index in (0..ref_index).rev() {
+
+            if usize::from(subaccount.order_refs[index].slot_index) == slot_index {
+                let node_index = usize::from(subaccount.order_refs[index].node_index);
+
                 let node = &self.order_book.nodes[node_index];
+
                 let increases = position == 0 || node.size.signum() == position.signum();
+
                 if increases {
-                    self.cancel_order_ref(subaccount, slot_index, ref_index)?;
+                    self.cancel_order_ref(subaccount, slot_index, index)?;
                 }
             }
         }
+
         Ok(())
     }
 
@@ -2348,11 +2380,14 @@ impl MarketState {
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
             .ok_or(StateError::NotFound)?;
+
         let position = self.projected_position(subaccount, slot_index)?;
+
         let negated = match position.checked_neg() {
             Some(size) => size,
             None => return Ok(()),
         };
+
         let opposite_side = match Side::from_size(negated) {
             Ok(side) => side,
             Err(_) => {
@@ -2360,6 +2395,7 @@ impl MarketState {
                 return Ok(());
             }
         };
+
         let opposite_sign = match opposite_side {
             Side::Long => 1i64,
             Side::Short => -1i64,
@@ -2370,92 +2406,96 @@ impl MarketState {
         let mut candidates = [(0i16, 0u16); super::MAX_ORDERS];
         let mut candidate_count = 0usize;
         let mut opposite_total = 0u64;
+
         for reference in subaccount.iter_order_refs() {
             if usize::from(reference.slot_index) == slot_index {
                 let node = &self.order_book.nodes[usize::from(reference.node_index)];
+
                 if node.get_side() != opposite_side || node.remaining_size == 0 {
                     continue;
                 }
+
                 opposite_total = opposite_total
                     .checked_add(node.remaining_size.unsigned_abs())
                     .ok_or(StateError::ArithmeticOverflow)?;
+
                 candidates[candidate_count] = (node.tick, reference.node_index);
+
                 candidate_count += 1;
             }
         }
+
         let needed = position.unsigned_abs();
+
         if opposite_total <= needed {
             return Ok(());
         }
 
-        // Insertion sort into fill order: shorts fill from the lowest tick and
+        // Shorts fill from the lowest tick and
         // longs from the highest tick, mirroring the book's best-tick choice.
-        let fills_first = |candidate: i16, against: i16| match opposite_side {
-            Side::Short => candidate < against,
-            Side::Long => candidate > against,
+        let fills_first = |candidate: &(i16, u16), against: &(i16, u16)| match opposite_side {
+            Side::Short => candidate.0.cmp(&against.0),
+            Side::Long => against.0.cmp(&candidate.0),
         };
-        for position_index in 1..candidate_count {
-            let entry = candidates[position_index];
-            let mut hole = position_index;
-            while hole > 0 && fills_first(entry.0, candidates[hole - 1].0) {
-                candidates[hole] = candidates[hole - 1];
-                hole -= 1;
-            }
-            candidates[hole] = entry;
-        }
+
+        candidates[..candidate_count].sort_unstable_by(fills_first);
 
         let mut kept = 0u64;
+
         for &(tick, node_index) in &candidates[..candidate_count] {
             let node_index = usize::from(node_index);
+
             let size = self.order_book.nodes[node_index]
                 .remaining_size
                 .unsigned_abs();
-            if kept >= needed {
+
+            if kept == needed {
                 let Some(ref_index) =
                     Self::find_ref_index_by_node(subaccount, slot_index, node_index)
                 else {
                     return Err(StateError::InvalidReference);
                 };
+
                 self.cancel_order_ref(subaccount, slot_index, ref_index)?;
-            } else if kept.checked_add(size).is_some_and(|total| total <= needed) {
+            } else if kept + size <= needed { 
                 kept += size;
             } else {
                 // The straddling order: trim it to exactly cover the position.
                 let trim_target = needed - kept;
+
                 kept = needed;
-                let minimum = self.order_book.minimum_order_size_atoms;
-                if trim_target < minimum {
-                    let Some(ref_index) =
-                        Self::find_ref_index_by_node(subaccount, slot_index, node_index)
-                    else {
-                        return Err(StateError::InvalidReference);
-                    };
-                    self.cancel_order_ref(subaccount, slot_index, ref_index)?;
-                } else {
-                    let rate = self.rate_at_tick(tick)?.to_fixed_point();
-                    let signed_target = i64::try_from(trim_target)
-                        .ok()
-                        .and_then(|target| target.checked_mul(opposite_sign))
-                        .ok_or(StateError::ArithmeticOverflow)?;
-                    let mut next_risk = subaccount.markets[slot_index].order_risk;
-                    next_risk.subtract(
-                        opposite_side,
-                        size.checked_sub(trim_target)
-                            .ok_or(StateError::ArithmeticOverflow)?,
-                        rate,
-                        self.config.rate_floor,
-                        self.order_risk_scale(),
-                    )?;
-                    let pending_size = self.order_book.nodes[node_index].pending_fill_size();
-                    let next_size = pending_size
-                        .checked_add(signed_target)
-                        .ok_or(StateError::ArithmeticOverflow)?;
-                    self.order_book
-                        .set_order_sizes(node_index, next_size, signed_target)?;
-                    subaccount.markets[slot_index].order_risk = next_risk;
-                }
+
+                let rate = self.rate_at_tick(tick)?.to_fixed_point();
+
+                let signed_target = i64::try_from(trim_target)
+                    .ok()
+                    .and_then(|target| target.checked_mul(opposite_sign))
+                    .ok_or(StateError::ArithmeticOverflow)?;
+
+                let mut next_risk = subaccount.markets[slot_index].order_risk;
+
+                next_risk.subtract(
+                    opposite_side,
+                    size.checked_sub(trim_target)
+                        .ok_or(StateError::ArithmeticOverflow)?,
+                    rate,
+                    self.config.rate_floor,
+                    self.order_risk_scale(),
+                )?;
+
+                let pending_size = self.order_book.nodes[node_index].pending_fill_size();
+
+                let next_size = pending_size
+                    .checked_add(signed_target)
+                    .ok_or(StateError::ArithmeticOverflow)?;
+
+                self.order_book
+                    .set_order_sizes(node_index, next_size, signed_target)?;
+
+                subaccount.markets[slot_index].order_risk = next_risk;
             }
         }
+
         Ok(())
     }
 
@@ -2476,11 +2516,13 @@ impl MarketState {
         market_slot_index: usize,
     ) -> StateResult<()> {
         let market_slot = &subaccount.markets[market_slot_index];
+
         let floating_delta = self
             .floating_index
             .to_raw_bits()
             .checked_sub(market_slot.floating_index_snapshot.to_raw_bits())
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let floating_atoms = fixed_perp_math::rate::RateDelta::from_i64f64(
             fixed::types::I64F64::from_bits(floating_delta),
         )
@@ -2497,6 +2539,7 @@ impl MarketState {
             .to_raw_bits()
             .checked_sub(market_slot.fee_index_snapshot.to_raw_bits())
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let fee_atoms = fixed_perp_math::rate::FeeRate::try_from_i64f64(
             fixed::types::I64F64::from_bits(fee_delta),
         )
@@ -2509,11 +2552,13 @@ impl MarketState {
             )
         })
         .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let next_settlement_balance = market_slot
             .settlement_balance_atoms
             .checked_add(floating_atoms)
             .and_then(|value| value.checked_sub(i128::try_from(fee_atoms).ok()?))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let next_accrued_fee = self
             .accrued_protocol_fee_atoms
             .checked_add(fee_atoms)
@@ -2521,6 +2566,7 @@ impl MarketState {
 
         subaccount.markets[market_slot_index].settlement_balance_atoms = next_settlement_balance;
         self.accrued_protocol_fee_atoms = next_accrued_fee;
+
         Ok(())
     }
 
@@ -2547,6 +2593,7 @@ impl MarketState {
         let reference = subaccount.order_refs[ref_index];
         let slot_index = usize::from(reference.slot_index);
         let node_index = usize::from(reference.node_index);
+
         let (
             pending,
             remaining_size,
@@ -2567,6 +2614,7 @@ impl MarketState {
                 node.pending_fixed_payment_atoms,
             )
         };
+
         if pending == 0 {
             return Ok(());
         }
@@ -2578,10 +2626,12 @@ impl MarketState {
             .position_size
             .checked_add(pending)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let floating_delta = i128::from(pending)
             .checked_mul(self.floating_index.to_raw_bits())
             .and_then(|value| value.checked_sub(pending_floating_index_basis.to_raw_bits()))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let floating_atoms = fixed_perp_math::rate::RateDelta::from_i64f64(
             fixed::types::I64F64::from_bits(floating_delta),
         )
@@ -2592,10 +2642,12 @@ impl MarketState {
             self.config.tick_scale,
         )
         .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let fee_delta = i128::from(pending.unsigned_abs())
             .checked_mul(self.fee_index.to_raw_bits())
             .and_then(|value| value.checked_sub(pending_fee_index_basis.to_raw_bits()))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let fee_atoms = fixed_perp_math::rate::FeeRate::try_from_i64f64(
             fixed::types::I64F64::from_bits(fee_delta),
         )
@@ -2607,24 +2659,31 @@ impl MarketState {
             self.config.tick_scale,
         )
         .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let cash_delta = floating_atoms
             .checked_sub(i128::try_from(fee_atoms).map_err(|_| StateError::ArithmeticOverflow)?)
             .and_then(|value| value.checked_add(pending_fixed_payment_atoms))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let next_cash = subaccount.markets[slot_index]
             .settlement_balance_atoms
             .checked_add(cash_delta)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let next_accrued_fee = self
             .accrued_protocol_fee_atoms
             .checked_add(fee_atoms)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let old_position_abs =
             u128::from(subaccount.markets[slot_index].position_size.unsigned_abs());
+
         let new_position_abs = u128::from(next_position.unsigned_abs());
         let pending_abs = u128::from(pending.unsigned_abs());
         let rate = self.rate_at_tick(tick)?.to_fixed_point();
+
         let mut next_risk = subaccount.markets[slot_index].order_risk;
+
         next_risk.subtract(
             side,
             pending.unsigned_abs(),
@@ -2632,18 +2691,21 @@ impl MarketState {
             self.config.rate_floor,
             self.order_risk_scale(),
         )?;
+
         self.materialize_pending_maker_oi(pending_abs, old_position_abs, new_position_abs)?;
 
         subaccount.markets[slot_index].settlement_balance_atoms = next_cash;
         self.accrued_protocol_fee_atoms = next_accrued_fee;
         subaccount.markets[slot_index].position_size = next_position;
         subaccount.markets[slot_index].order_risk = next_risk;
+
         if remaining_size == 0 {
             self.order_book.release_detached_node(node_index);
             subaccount.remove_order_ref(ref_index);
         } else {
             self.order_book.commit_pending_fill(node_index);
         }
+
         Ok(())
     }
 
@@ -2670,21 +2732,26 @@ impl MarketState {
     /// Calculates the incremental taker fee for a bounded aggregate fill size.
     fn taker_fee_atoms(&self, size: u64, time_to_maturity: i64) -> StateResult<u128> {
         let rate = fixed::types::I64F64::from_bits(self.config.taker_fee_rate.to_raw_bits());
+
         let elapsed = fixed::types::I64F64::checked_from_num(time_to_maturity)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let year = fixed::types::I64F64::checked_from_num(SECONDS_PER_YEAR)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         // Premultiply both decimal scales before annual division so a small
         // fee is not truncated at Q64.64 precision. The conversion below
         // removes tick scale and normalizes the underlying atoms once.
         let market_scale = decimal_scale(self.config.tick_scale)?;
         let settlement_scale = decimal_scale(self.config.settlement_decimals)?;
+
         let maturity_scaled_rate = rate
             .checked_mul(elapsed)
             .and_then(|value| value.checked_mul(market_scale))
             .and_then(|value| value.checked_mul(settlement_scale))
             .and_then(|value| value.checked_div(year))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         fixed_perp_math::rate::FeeRate::try_from_i64f64(maturity_scaled_rate)
             .map_err(|_| StateError::InvalidConfiguration)?
             .settlement_fee_atoms_scaled(
@@ -2694,88 +2761,6 @@ impl MarketState {
                 self.config.tick_scale,
             )
             .map_err(|_| StateError::ArithmeticOverflow)
-    }
-
-    /// Splits one fill's fixed payment and taker fee into the two cash legs.
-    ///
-    /// The maker is credited `fixed_payment_atoms`. The taker is debited that
-    /// amount and the fee. The booked fee is `fee_atoms`. On success the three
-    /// legs sum to zero.
-    pub fn split_fill_cash(
-        fixed_payment_atoms: i128,
-        fee_atoms: u128,
-    ) -> StateResult<(i128, i128, i128)> {
-        let payment_bits = fixed_payment_atoms as u128;
-        let (taker, maker, fee) = Self::split_fill_cash_limbs(
-            payment_bits as u64,
-            (payment_bits >> 64) as u64,
-            fee_atoms as u64,
-            (fee_atoms >> 64) as u64,
-        )
-        .ok_or(StateError::ArithmeticOverflow)?;
-        Ok((
-            Self::i128_from_limbs(taker.0, taker.1),
-            Self::i128_from_limbs(maker.0, maker.1),
-            Self::i128_from_limbs(fee.0, fee.1),
-        ))
-    }
-
-    fn i128_from_limbs(low: u64, high: u64) -> i128 {
-        ((u128::from(high) << 64) | u128::from(low)) as i128
-    }
-
-    fn signed_fee_limbs(low: u64, high: u64) -> Option<(u64, u64)> {
-        if high >= 1u64 << 63 {
-            None
-        } else {
-            Some((low, high))
-        }
-    }
-
-    fn checked_neg_limbs(low: u64, high: u64) -> Option<(u64, u64)> {
-        if low == 0 && high == 1u64 << 63 {
-            return None;
-        }
-        let carry = u64::from(low == 0);
-        let negated_low = (!low).wrapping_add(1);
-        let negated_high = (!high).wrapping_add(carry);
-        Some((negated_low, negated_high))
-    }
-
-    fn checked_sub_limbs(
-        left_low: u64,
-        left_high: u64,
-        right_low: u64,
-        right_high: u64,
-    ) -> Option<(u64, u64)> {
-        let borrow = u64::from(left_low < right_low);
-        let low = left_low.wrapping_sub(right_low);
-        let high = left_high.wrapping_sub(right_high).wrapping_sub(borrow);
-        let left_negative = left_high & (1u64 << 63) != 0;
-        let right_negative = right_high & (1u64 << 63) != 0;
-        let result_negative = high & (1u64 << 63) != 0;
-        if left_negative != right_negative && left_negative != result_negative {
-            None
-        } else {
-            Some((low, high))
-        }
-    }
-
-    /// Same split as `split_fill_cash`, in the two 64-bit words of each value.
-    ///
-    /// Each pair is `(low, high)` in two's complement. The fee's high word must
-    /// fit in a signed 128-bit value. Negating `i128::MIN`, or a subtraction
-    /// that leaves that range, returns `None`.
-    pub fn split_fill_cash_limbs(
-        payment_low: u64,
-        payment_high: u64,
-        fee_low: u64,
-        fee_high: u64,
-    ) -> Option<((u64, u64), (u64, u64), (u64, u64))> {
-        let fee = Self::signed_fee_limbs(fee_low, fee_high)?;
-        let negated = Self::checked_neg_limbs(payment_low, payment_high)?;
-        let taker = Self::checked_sub_limbs(negated.0, negated.1, fee.0, fee.1)?;
-        Some((taker, (payment_low, payment_high), fee))
     }
 
     /// Applies a validated best-head fill only after every arithmetic result is known.
@@ -2793,35 +2778,41 @@ impl MarketState {
         let maker_fill = taker_fill
             .checked_neg()
             .ok_or(StateError::ArithmeticOverflow)?;
-        let (cash_delta, maker_fixed_delta, _) =
-            Self::split_fill_cash(fixed_payment_atoms, fee_atoms)?;
+
         let (next_remaining, next_pending_floating, next_pending_fee, next_pending_payment) = {
             let node = &self.order_book.nodes[order_node_index];
+
             let next_remaining = node
                 .remaining_size
                 .checked_sub(maker_fill)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             // Preserve each maker fill at its fill-time indices until the maker is materialized.
             let floating_delta = i128::from(maker_fill)
                 .checked_mul(self.floating_index.to_raw_bits())
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let next_pending_floating = node
                 .pending_floating_index_basis
                 .to_raw_bits()
                 .checked_add(floating_delta)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let fee_delta = i128::from(maker_fill.unsigned_abs())
                 .checked_mul(self.fee_index.to_raw_bits())
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let next_pending_fee = node
                 .pending_fee_index_basis
                 .to_raw_bits()
                 .checked_add(fee_delta)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let next_pending_payment = node
                 .pending_fixed_payment_atoms
-                .checked_add(maker_fixed_delta)
+                .checked_add(fixed_payment_atoms)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             (
                 next_remaining,
                 next_pending_floating,
@@ -2829,32 +2820,48 @@ impl MarketState {
                 next_pending_payment,
             )
         };
+
         // The absent maker may be reducing exposure, so reserve its full matched amount
         // conservatively until its subaccount is available for exact materialization.
         let next_reserve = self
             .pending_maker_oi_reserve
             .checked_add(u128::from(maker_fill.unsigned_abs()))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let slot = &taker.markets[market_slot_index];
+
         let next_position = slot
             .position_size
             .checked_add(taker_fill)
             .ok_or(StateError::ArithmeticOverflow)?;
+
+        let taker_payment = fixed_payment_atoms
+            .checked_neg()
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        let cash_delta = taker_payment
+            .checked_sub(i128::try_from(fee_atoms).map_err(|_| StateError::ArithmeticOverflow)?)
+            .ok_or(StateError::ArithmeticOverflow)?;
+
         let next_cash = taker.markets[market_slot_index]
             .settlement_balance_atoms
             .checked_add(cash_delta)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let next_materialized = self
             .materialized_gross_open_interest
             .checked_sub(u128::from(slot.position_size.unsigned_abs()))
             .and_then(|value| value.checked_add(u128::from(next_position.unsigned_abs())))
             .ok_or(StateError::Conflict)?;
+
         let capped = next_materialized
             .checked_add(next_reserve)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         if capped > self.config.hard_gross_open_interest_cap_atoms {
             return Err(StateError::Conflict);
         }
+
         let next_accrued_fee = self
             .accrued_protocol_fee_atoms
             .checked_add(fee_atoms)
@@ -2865,17 +2872,21 @@ impl MarketState {
         if next_remaining == 0 {
             self.order_book.detach_from_fifo(order_node_index)?;
         }
+
         // Commit only after every fallible arithmetic and cap check above has succeeded.
         let node = &mut self.order_book.nodes[order_node_index];
+
         node.remaining_size = next_remaining;
         node.pending_floating_index_basis = FixedPoint::from_raw_bits(next_pending_floating);
         node.pending_fee_index_basis = FixedPoint::from_raw_bits(next_pending_fee);
         node.pending_fixed_payment_atoms = next_pending_payment;
+
         self.pending_maker_oi_reserve = next_reserve;
         self.materialized_gross_open_interest = next_materialized;
         taker.markets[market_slot_index].settlement_balance_atoms = next_cash;
         taker.markets[market_slot_index].position_size = next_position;
         self.accrued_protocol_fee_atoms = next_accrued_fee;
+
         Ok(())
     }
 
@@ -2885,9 +2896,11 @@ impl MarketState {
             .materialized_gross_open_interest
             .checked_add(self.pending_maker_oi_reserve)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         if capped > self.config.hard_gross_open_interest_cap_atoms {
             return Err(StateError::Conflict);
         }
+
         Ok(capped)
     }
 
@@ -2908,13 +2921,16 @@ impl MarketState {
         {
             return Err(StateError::Conflict);
         }
+
         // Pending fills reserve their full absolute size. Materialization
         // replaces that conservative reserve with the exact position OI delta.
         let exact_delta = new_position_abs.abs_diff(old_position_abs);
+
         // Exact replacement must not turn a bounded reservation into extra OI.
         if exact_delta > reserved_amount {
             return Err(StateError::Conflict);
         }
+
         let after_old = self
             .materialized_gross_open_interest
             .checked_sub(old_position_abs)
@@ -2933,6 +2949,7 @@ impl MarketState {
             .materialized_gross_open_interest
             .checked_add(self.pending_maker_oi_reserve)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         // A cap cut must not trap a fill that was already reserved. Maturity
         // can replace that reserve as long as capped open interest does not grow.
         if next_capped > self.config.hard_gross_open_interest_cap_atoms
@@ -2940,8 +2957,10 @@ impl MarketState {
         {
             return Err(StateError::Conflict);
         }
+
         self.materialized_gross_open_interest = next_materialized;
         self.pending_maker_oi_reserve = next_reserve;
+
         Ok(())
     }
 
@@ -2959,6 +2978,7 @@ impl MarketState {
         if time_to_maturity < 0 {
             return Err(StateError::InvalidClock);
         }
+
         Rate::from_i64f64(mark_rate.to_i64f64())
             .fixed_payment_atoms_scaled(
                 i128::from(position_size),
@@ -3016,24 +3036,28 @@ impl MarketState {
         mark_rate: FixedPoint,
     ) -> StateResult<FixedPoint> {
         let position_abs = position_size.unsigned_abs();
+
         let pm_alone = FixedPoint::from_raw_bits(super::OrderRiskAggregate::pm_contribution(
             position_abs,
             mark_rate,
             self.config.rate_floor,
             self.order_risk_scale(),
         )?);
+
         let total_long = Self::side_pm_total(
             position_size,
             order_risk.sum_long_order_size,
             order_risk.sum_long_order_pm,
             pm_alone,
         )?;
+
         let total_short = Self::side_pm_total(
             -position_size,
             order_risk.sum_short_order_size,
             order_risk.sum_short_order_pm,
             pm_alone,
         )?;
+
         if total_long.to_raw_bits() >= total_short.to_raw_bits() {
             Ok(total_long)
         } else {
@@ -3041,8 +3065,7 @@ impl MarketState {
         }
     }
 
-    /// Aggregates one order side against the settled position exactly as Boros
-    /// does: an opposite-side order book fully covered by the position carries
+    /// An opposite-side order book fully covered by the position carries
     /// no marginal risk, same-side orders add their principal, and a netted
     /// book only keeps the excess above the position's own principal.
     fn side_pm_total(
@@ -3052,21 +3075,26 @@ impl MarketState {
         pm_alone: FixedPoint,
     ) -> StateResult<FixedPoint> {
         let position_abs = signed_position.unsigned_abs();
+
         if signed_position < 0 && order_size <= position_abs {
             return Ok(FixedPoint::from_raw_bits(0));
         }
+
         if signed_position > 0 {
             let sum = order_pm
                 .to_raw_bits()
                 .checked_add(pm_alone.to_raw_bits())
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             return Ok(FixedPoint::from_raw_bits(sum));
         }
+
         if order_pm.to_raw_bits() > pm_alone.to_raw_bits() {
             let excess = order_pm
                 .to_raw_bits()
                 .checked_sub(pm_alone.to_raw_bits())
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             Ok(FixedPoint::from_raw_bits(excess))
         } else {
             Ok(FixedPoint::from_raw_bits(0))
@@ -3084,20 +3112,24 @@ impl MarketState {
         if time_to_maturity < 0 {
             return Err(StateError::InvalidClock);
         }
+
         let duration = I64F64::checked_from_num(time_to_maturity)
             .ok_or(StateError::ArithmeticOverflow)?
             .max(
                 I64F64::checked_from_num(i64::from(self.config.margin_time_threshold_seconds))
                     .ok_or(StateError::ArithmeticOverflow)?,
             );
+
         let year =
             I64F64::checked_from_num(SECONDS_PER_YEAR).ok_or(StateError::ArithmeticOverflow)?;
+
         let unrounded = risk_principal
             .to_i64f64()
             .checked_mul(factor.to_i64f64())
             .and_then(|value| value.checked_mul(duration))
             .and_then(|value| value.checked_div(year))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         unrounded
             .checked_ceil()
             .ok_or(StateError::ArithmeticOverflow)?
@@ -3139,11 +3171,13 @@ impl MarketState {
         now: i64,
     ) -> StateResult<ClosingAction> {
         let mark = self.current_mark_rate(now)?;
+
         let time_to_maturity = self
             .config
             .maturity_timestamp
             .checked_sub(now)
             .ok_or(StateError::InvalidClock)?;
+
         let final_value = self.position_value(post_position_size, mark, time_to_maturity)?;
         let final_risk = self.risk_principal(post_position_size, post_order_risk, mark)?;
         let final_margin = self.maintenance_margin(final_risk, time_to_maturity)?;
@@ -3154,10 +3188,11 @@ impl MarketState {
             post_order_risk.sum_short_order_size,
             new_resting_order_side,
         );
+
         let mut requires_strict_im = true;
+
         if is_closing_action {
-            // Boros `_checkMargin` closing-order mark displacement: the
-            // proposed worst closing rate must stay within
+            // The proposed worst closing rate must stay within
             // `closing_margin_relief_bound_factor * max(abs(mark), rate_floor)`
             // of the mark, signed by the final position side.
             if new_resting_order_side.is_some() {
@@ -3167,16 +3202,20 @@ impl MarketState {
                     .checked_abs()
                     .ok_or(StateError::ArithmeticOverflow)?
                     .max(I64F64::from_bits(self.config.rate_floor.to_raw_bits()));
+
                 let bound = base
                     .checked_mul(self.config.closing_margin_relief_bound_factor.to_i64f64())
                     .ok_or(StateError::ArithmeticOverflow)?;
+
                 let sign = I64F64::checked_from_num(post_position_size.signum())
                     .ok_or(StateError::ArithmeticOverflow)?;
+
                 let displacement = mark
                     .to_i64f64()
                     .checked_sub(worst.to_i64f64())
                     .and_then(|delta| delta.checked_mul(sign))
                     .ok_or(StateError::ArithmeticOverflow)?;
+
                 if displacement > bound {
                     return Ok(ClosingAction {
                         is_closing_action,
@@ -3187,27 +3226,33 @@ impl MarketState {
                     });
                 }
             }
+
             // Margin relief: `value_consumed = V_pre - V_post - P` must stay
             // at most `critical_health_ratio * (MM_pre - MM_post)`, with the
-            // ratio product floored as Boros `mulFloor` does. The close-only
+            // ratio product floored. The close-only
             // exemption never enters this relief decision.
             let pre_value = self.position_value(pre_position_size, mark, time_to_maturity)?;
             let pre_risk = self.risk_principal(pre_position_size, pre_order_risk, mark)?;
             let pre_margin = self.maintenance_margin(pre_risk, time_to_maturity)?;
+
             let value_consumed = pre_value
                 .checked_sub(final_value)
                 .and_then(|value| value.checked_sub(payment_atoms))
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let mm_reduction = pre_margin
                 .checked_sub(final_margin)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
             let allowed = critical_health_ratio
                 .checked_mul_int(mm_reduction)
                 .map_err(|_| StateError::ArithmeticOverflow)?
                 .floor_atoms()
                 .map_err(|_| StateError::ArithmeticOverflow)?;
+
             requires_strict_im = value_consumed > allowed;
         }
+
         Ok(ClosingAction {
             is_closing_action,
             closing_status_allowed: is_closing_action || close_only_exempt,
@@ -3262,7 +3307,9 @@ pub fn aggregate_is_closing_action(
     {
         return false;
     }
+
     let final_sign = post_position.signum();
+
     match final_sign {
         0 => {
             if final_long_order_size != 0 || final_short_order_size != 0 {
@@ -3280,6 +3327,7 @@ pub fn aggregate_is_closing_action(
             }
         }
     }
+
     if let Some(side) = new_resting_order_side {
         // This check mainly enforces cases the above doesn't cover because it doesn't detect
         // match whether or not a match occurs.
@@ -3290,6 +3338,7 @@ pub fn aggregate_is_closing_action(
             return false;
         }
     }
+
     true
 }
 
@@ -3332,10 +3381,12 @@ impl PortfolioHealth {
         let MarginRequirement::Initial(required_margin) = self.required_margin else {
             return Err(StateError::Conflict);
         };
+
         let available = self
             .adjusted_total_assets
             .checked_add(self.total_value)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         Ok(available >= required_margin)
     }
 
@@ -3344,15 +3395,18 @@ impl PortfolioHealth {
         let MarginRequirement::Maintenance(required_margin) = self.required_margin else {
             return Err(StateError::Conflict);
         };
+
         let required = critical_health_ratio
             .checked_mul_int(required_margin)
             .map_err(|_| StateError::ArithmeticOverflow)?
             .ceil_atoms()
             .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let available = self
             .adjusted_total_assets
             .checked_add(self.total_value)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         Ok(available >= required)
     }
 
@@ -3368,34 +3422,41 @@ impl PortfolioHealth {
         let MarginRequirement::Maintenance(required_margin) = self.required_margin else {
             return Err(StateError::Conflict);
         };
+
         let threshold = risky_order_cancellation_ratio
             .checked_mul_int(required_margin)
             .map_err(|_| StateError::ArithmeticOverflow)?
             .ceil_atoms()
             .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let available = self
             .adjusted_total_assets
             .checked_add(self.total_value)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         Ok(available < threshold)
     }
 
-    /// Boros health ratio `value / maintenance`, accepted only on `[0, 1)`.
+    /// Accepted only on `[0, 1)`.
     /// Negative value is bad debt and is not liquidatable here.
     pub fn liquidation_health_ratio(&self) -> StateResult<FixedPoint> {
         let MarginRequirement::Maintenance(maintenance) = self.required_margin else {
             return Err(StateError::Conflict);
         };
+
         if maintenance <= 0 {
             return Err(StateError::InvalidStatus);
         }
+
         let available = self
             .adjusted_total_assets
             .checked_add(self.total_value)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         if available < 0 || available >= maintenance {
             return Err(StateError::InvalidStatus);
         }
+
         self.maintenance_health_ratio()
     }
 
@@ -3405,16 +3466,20 @@ impl PortfolioHealth {
         let MarginRequirement::Maintenance(maintenance) = self.required_margin else {
             return Err(StateError::Conflict);
         };
+
         if maintenance <= 0 {
             return Err(StateError::InvalidStatus);
         }
+
         let available = self
             .adjusted_total_assets
             .checked_add(self.total_value)
             .ok_or(StateError::ArithmeticOverflow)?;
+
         let ratio = I64F64::checked_from_num(available)
             .and_then(|value| value.checked_div(I64F64::checked_from_num(maintenance)?))
             .ok_or(StateError::ArithmeticOverflow)?;
+
         Ok(FixedPoint::from_i64f64(ratio))
     }
 }
@@ -3428,6 +3493,7 @@ impl MarginGroup {
         {
             return Err(StateError::Conflict);
         }
+
         Ok(())
     }
 
@@ -3436,6 +3502,7 @@ impl MarginGroup {
         if self.group_id != subaccount.group_id {
             return Err(StateError::Conflict);
         }
+
         Ok(())
     }
 
@@ -3450,55 +3517,44 @@ impl MarginGroup {
         group_id: u16,
         collateral_state: Pubkey,
         settlement_state: Pubkey,
-        governance_key: Pubkey,
         critical_health_ratio: FixedPoint,
         risky_order_cancellation_ratio: FixedPoint,
     ) -> StateResult<()> {
         if group_id == 0
             || collateral_state == Pubkey::default()
             || settlement_state == Pubkey::default()
-            || governance_key == Pubkey::default()
             || critical_health_ratio.to_raw_bits() <= 0
             || risky_order_cancellation_ratio.to_raw_bits() < critical_health_ratio.to_raw_bits()
         {
             return Err(StateError::InvalidConfiguration);
         }
+
         self.group_id = group_id;
         self.bump = bump;
         self.status = GROUP_PENDING;
         self.collateral_state = collateral_state;
         self.settlement_state = settlement_state;
-        self.governance_key = governance_key;
         self.critical_health_ratio = critical_health_ratio;
         self.risky_order_cancellation_ratio = risky_order_cancellation_ratio;
         self.market_count = 0;
         self.subaccount_count = 0;
         let one = FixedPoint::from_raw_bits(1i128 << 64);
+
         self.collateral_factors = ValuationFactors {
             discount_factor: one,
             liability_factor: one,
         };
+
         self.settlement_factors = self.collateral_factors;
         self._pad_0 = [0; 4];
         self.reserved = [0; MARGIN_GROUP_RESERVED];
+
         Ok(())
     }
 
-    /// Activates a pending group inside its coordinator-supplied window.
-    pub fn activate(
-        &mut self,
-        activation_window: &mut super::ProposalWindow,
-        now: i64,
-    ) -> StateResult<()> {
-        if self.status != GROUP_PENDING {
-            return Err(StateError::InvalidStatus);
-        }
-
-        activation_window.consume(now)?;
-
+    /// Activates a structurally initialized group after resource authorization.
+    pub fn activate(&mut self){
         self.status = GROUP_ACTIVE;
-
-        Ok(())
     }
 
     /// Computes portfolio health from the transient AssetState observations
@@ -3551,6 +3607,7 @@ impl MarginGroup {
         )
     }
 
+    /// The observations should be validated before calling this.
     #[allow(clippy::too_many_arguments)]
     fn portfolio_health_with_assets<'a>(
         &self,
@@ -3565,21 +3622,26 @@ impl MarginGroup {
     ) -> StateResult<PortfolioHealth> {
         let mut markets_by_slot: [Option<PortfolioMarketObservation<'a>>; super::MAX_MARKETS] =
             [None; super::MAX_MARKETS];
+
         for observation in markets {
             let Some(slot) = subaccount.lookup_market(observation.market.config.market_id) else {
                 continue;
             };
+
             markets_by_slot[slot] = Some(observation);
         }
 
         let collateral_adjusted = self
             .collateral_factors
             .apply(subaccount.collateral_balance_atoms)?;
+
         let collateral_endpoint = PriceEndpoint::for_signed_value(collateral_adjusted);
+
         let mut assets = collateral_observation
             .conservative_price_for(collateral_asset, collateral_endpoint)?
             .scaled_value_atoms(collateral_adjusted, collateral_asset.decimals)
             .map_err(|_| StateError::ArithmeticOverflow)?;
+
         let mut total_value = 0i128;
         let mut total_margin = 0i128;
 
@@ -3587,28 +3649,26 @@ impl MarginGroup {
             if slot.market_id == 0 {
                 continue;
             }
+
             let observation = markets_by_slot[slot_index].ok_or(StateError::NotFound)?;
             let market = observation.market;
             let underlying_asset = observation.underlying_asset;
-            observation.underlying.validate(
-                now,
-                underlying_asset.max_age_seconds,
-                underlying_asset.max_confidence_ratio,
-                underlying_asset.max_ema_deviation,
-            )?;
+
             let time = market
                 .config
                 .maturity_timestamp
                 .checked_sub(now)
                 .ok_or(StateError::InvalidClock)?;
+
             let mark = market.current_mark_rate(now)?;
             let position_value = market.position_value(slot.position_size, mark, time)?;
             let position_value = market.position_factors.apply(position_value)?;
 
-            // The source observation is an underlying/settlement price.  The
-            // fixed-leg value is scaled by that cross-rate exactly once and
+            // The source observation is an underlying/settlement price.
+            // The fixed-leg value is scaled by that cross-rate exactly once and
             // then conservatively rounded at the settlement-atom boundary.
             let position_endpoint = PriceEndpoint::for_signed_value(position_value);
+
             let underlying_price = observation
                 .underlying
                 .conservative_price_for(underlying_asset, position_endpoint)?;
@@ -3623,10 +3683,9 @@ impl MarginGroup {
                 .map_err(|_| StateError::ArithmeticOverflow)?
                 .floor_atoms()
                 .map_err(|_| StateError::ArithmeticOverflow)?;
+
             let position_value = self.settlement_factors.apply(position_value)?;
-            let position_endpoint = PriceEndpoint::for_signed_value(position_value);
-            let settlement_price = settlement_observation
-                .conservative_price_for(settlement_asset, position_endpoint)?;
+
             total_value = total_value
                 .checked_add(
                     settlement_price
@@ -3638,9 +3697,12 @@ impl MarginGroup {
             let balance = self
                 .settlement_factors
                 .apply(slot.settlement_balance_atoms)?;
+
             let balance_endpoint = PriceEndpoint::for_signed_value(balance);
+
             let balance_price = settlement_observation
                 .conservative_price_for(settlement_asset, balance_endpoint)?;
+
             assets = assets
                 .checked_add(
                     balance_price
@@ -3650,14 +3712,17 @@ impl MarginGroup {
                 .ok_or(StateError::ArithmeticOverflow)?;
 
             let risk = market.risk_principal(slot.position_size, &slot.order_risk, mark)?;
+
             let margin = match requirement_type {
                 MarginRequirementType::Initial => market.initial_margin(risk, time)?,
                 MarginRequirementType::Maintenance => market.maintenance_margin(risk, time)?,
             };
+
             let margin = self.settlement_factors.apply(-margin)?;
             let margin_endpoint = PriceEndpoint::for_signed_value(margin);
             let margin_price =
                 settlement_observation.conservative_price_for(settlement_asset, margin_endpoint)?;
+
             total_margin = total_margin
                 .checked_add(
                     margin_price
@@ -3673,6 +3738,7 @@ impl MarginGroup {
             MarginRequirementType::Initial => MarginRequirement::Initial(total_margin),
             MarginRequirementType::Maintenance => MarginRequirement::Maintenance(total_margin),
         };
+
         Ok(PortfolioHealth {
             adjusted_total_assets: assets,
             total_value,
@@ -3689,22 +3755,27 @@ impl MarginGroup {
         for slot_index in 0..super::MAX_MARKETS {
             let (market_id, has_orders) = {
                 let slot = &subaccount.markets[slot_index];
+
                 (
                     slot.market_id,
                     slot.order_risk.sum_long_order_size != 0
                         || slot.order_risk.sum_short_order_size != 0,
                 )
             };
+
             if market_id == 0 || !has_orders {
                 continue;
             }
+
             let market = markets
                 .iter_mut()
                 .flatten()
                 .find(|market| market.config.market_id == market_id)
                 .ok_or(StateError::InvalidReference)?;
+
             market.close_all_orders(subaccount, slot_index)?;
         }
+
         Ok(())
     }
 
@@ -3720,6 +3791,7 @@ impl MarginGroup {
         markets: &mut [&mut MarketState],
     ) -> StateResult<()> {
         let mut slots_with_refs = [false; super::MAX_MARKETS];
+
         for reference in subaccount.iter_order_refs() {
             slots_with_refs[usize::from(reference.slot_index)] = true;
         }
@@ -3728,11 +3800,14 @@ impl MarginGroup {
             let Some(slot_index) = subaccount.lookup_market(market.config.market_id) else {
                 continue;
             };
+
             if !slots_with_refs[slot_index] {
                 continue;
             }
+
             market.close_only_cleanup(subaccount)?;
         }
+
         Ok(())
     }
 

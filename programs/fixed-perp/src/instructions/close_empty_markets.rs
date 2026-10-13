@@ -14,6 +14,7 @@ pub struct CloseEmptyMarkets<'info> {
 
 pub(crate) fn slot_is_empty(subaccount: &Subaccount, slot_index: usize) -> bool {
     let slot = &subaccount.markets[slot_index];
+
     slot.position_size == 0 && slot.settlement_balance_atoms == 0 && slot.order_risk.is_empty()
 }
 
@@ -23,15 +24,20 @@ fn close_market_for_slot<'info>(
     remaining_accounts: &'info [AccountInfo<'info>],
 ) -> Result<()> {
     let market_id = subaccount.markets[slot_index].market_id;
+
     for account_info in remaining_accounts {
         let loader = AccountLoader::<MarketState>::try_from(account_info)
             .map_err(|_| StateError::InvalidAccountInfo)?;
+
         let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+
         if market.config.market_id == market_id {
             subaccount.close_market(slot_index, &mut market)?;
+
             return Ok(());
         }
     }
+
     Err(StateError::AccountNotFound.into())
 }
 
@@ -56,5 +62,6 @@ pub fn handle_close_empty_markets<'info>(
     context: Context<'info, CloseEmptyMarkets<'info>>,
 ) -> Result<()> {
     let mut subaccount = context.accounts.subaccount.load_mut()?;
+
     close_empty_markets_from_accounts(&mut subaccount, context.remaining_accounts)
 }

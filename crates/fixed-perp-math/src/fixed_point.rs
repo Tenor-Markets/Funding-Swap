@@ -90,27 +90,38 @@ impl FixedPoint {
     /// within the exact integer range.
     pub fn scaled_value_atoms(self, atoms: i128, decimals: u8) -> Result<i128, MathError> {
         let scale = pow10(decimals).ok_or(MathError::Overflow)?;
+
         let mut numerator = self.to_raw_bits().unsigned_abs();
+
         let mut amount = atoms.unsigned_abs();
+
         let mut denominator = (1u128 << I64F64::FRAC_NBITS)
             .checked_mul(scale)
             .ok_or(MathError::Overflow)?;
+
         let g = gcd_u128(numerator, denominator);
         numerator /= g;
         denominator /= g;
+
         let g = gcd_u128(amount, denominator);
         amount /= g;
         denominator /= g;
+
         let product = numerator.checked_mul(amount).ok_or(MathError::Overflow)?;
+
         let quotient = product / denominator;
         let remainder = product % denominator;
+
         let negative = (self.to_raw_bits() < 0) ^ (atoms < 0);
+
         let rounded = if negative && remainder != 0 {
             quotient.checked_add(1).ok_or(MathError::Overflow)?
         } else {
             quotient
         };
+
         let value = i128::try_from(rounded).map_err(|_| MathError::Overflow)?;
+
         if negative {
             value.checked_neg().ok_or(MathError::Overflow)
         } else {

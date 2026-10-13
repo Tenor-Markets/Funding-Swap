@@ -67,9 +67,7 @@ impl OrderRef {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
 #[cfg_attr(feature = "idl-build", derive(AnchorSerialize, AnchorDeserialize))]
 pub struct MarketSlot {
-    pub market_id: u32,
-    // Keeps subsequent fixed-point fields naturally aligned in the fixed ABI.
-    pub _pad_0: [u8; 4],
+    pub market_id: u64,
     /// Signed derivative position in underlying atoms.
     pub position_size: i64,
     pub floating_index_snapshot: FixedPoint,
@@ -259,7 +257,7 @@ impl Subaccount {
         market_slot_index: usize,
         market: &mut MarketState,
     ) -> StateResult<()> {
-        // TODO: Remove the below check, the callers handle this.
+        // TODO: Remove the two checks below, the callers handle this.
         if !market.is_matured() {
             return Err(StateError::InvalidStatus);
         }
@@ -324,7 +322,7 @@ impl Subaccount {
     }
 
     /// Finds an active slot for the requested market identifier.
-    pub(crate) fn lookup_market(&self, market_id: u32) -> Option<usize> {
+    pub(crate) fn lookup_market(&self, market_id: u64) -> Option<usize> {
         self.markets
             .iter()
             .position(|slot| slot.market_id == market_id)
@@ -469,6 +467,7 @@ impl OrderRiskAggregate {
             self.sum_short_order_size = next_size;
             self.sum_short_order_pm = super::FixedPoint::from_raw_bits(next_pm);
         }
+
         Ok(())
     }
 }

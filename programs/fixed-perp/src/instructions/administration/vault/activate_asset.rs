@@ -1,29 +1,23 @@
 use crate::state::*;
 use anchor_lang::prelude::*;
 
-/// Permissionless activation of a pending AssetState after its governance
-/// account's snapshotted creation window opens.
+/// Squads enforces approval and delay; resource activation only checks lifecycle prerequisites.
 #[derive(Accounts)]
 pub struct ActivateAsset<'info> {
-    #[account(mut)]
-    pub asset: AccountLoader<'info, AssetState>,
+    pub authority: Signer<'info>,
     #[account(
-        mut,
-        constraint = asset.load()?.is_governance_key(asset_governance.key()) @ StateError::InvalidKey
+        constraint = global_governance.load()?.authority_for(GovernanceCategory::Resources, authority.key()) @ StateError::InvalidAuthority
     )]
-    pub asset_governance: AccountLoader<'info, AssetGovernance>,
+    pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
+    #[account(
+        mut, 
+        constraint = asset.load()?.is_pending() @ StateError::InvalidStatus
+    )]
+    pub asset: AccountLoader<'info, AssetState>,
 }
 
 pub fn handle_activate_asset(context: Context<ActivateAsset>) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
-    let mut asset = context.accounts.asset.load_mut()?;
-    asset.activate(
-        &mut context
-            .accounts
-            .asset_governance
-            .load_mut()?
-            .activation_window,
-        now,
-    )?;
+    context.accounts.asset.load_mut()?.activate();
+
     Ok(())
 }

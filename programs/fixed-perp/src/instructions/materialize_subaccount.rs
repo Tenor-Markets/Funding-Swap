@@ -12,6 +12,7 @@ pub(crate) fn materialize_market(
     market.materialize_position_indices(subaccount, slot_index)?;
 
     let mut ref_index = 0;
+
     while ref_index < usize::from(subaccount.order_ref_count) {
         if usize::from(subaccount.order_refs[ref_index].slot_index) != slot_index {
             ref_index += 1;
@@ -43,6 +44,7 @@ pub fn handle_materialize_subaccount<'info>(
     context: Context<'info, MaterializeSubaccount<'info>>,
 ) -> Result<()> {
     let mut subaccount = context.accounts.subaccount.load_mut()?;
+
     for account_info in context.remaining_accounts {
         let loader = AccountLoader::<MarketState>::try_from(account_info)
             .map_err(|_| StateError::InvalidReference)?;
@@ -54,7 +56,9 @@ pub fn handle_materialize_subaccount<'info>(
         let slot_index = subaccount
             .lookup_market(market.config.market_id)
             .ok_or(StateError::NotFound)?;
+
         materialize_market(&mut subaccount, &mut market, slot_index)?;
     }
+
     Ok(())
 }

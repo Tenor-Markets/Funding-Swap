@@ -9,6 +9,11 @@ The workspace is intentionally narrow:
 - `guide/guide.md` is reconciled with the implementation; its `DONT TOUCH`
   suffix remains byte-for-byte protected.
 
+Governance uses [eight direct authorities](guide/governance.md), with approval
+and timelocks delegated to Squads. The governance refactor changes account
+layouts and instruction interfaces; existing accounts need a separate migration
+or fresh deployment.
+
 ## Pinned environment
 
 - Host Rust is selected locally by `rust-toolchain.toml` at `1.90.0`.

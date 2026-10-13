@@ -80,8 +80,7 @@ pub struct AssetState {
     pub short_window: WithdrawalWindow,
     pub medium_window: WithdrawalWindow,
     pub long_window: WithdrawalWindow,
-    /// Resource-local governance account bound at asset creation.
-    pub governance_key: Pubkey,
+    /// Explicit tail padding for the zero-copy layout.
     pub _pad_3: [u8; 16],
 }
 
@@ -94,7 +93,6 @@ impl AssetState {
         &mut self,
         asset_id: u32,
         bump: u8,
-        governance_key: Pubkey,
         price_model: PriceModel,
         decimals: u8,
         token_account: Pubkey,
@@ -110,7 +108,6 @@ impl AssetState {
         long_window_limit_atoms: u128,
     ) -> StateResult<()> {
         if asset_id == 0
-            || governance_key == Pubkey::default()
             || decimals > fixed_perp_math::rate::MAX_DECIMALS
             || max_confidence_ratio.to_raw_bits() < 0
             || max_ema_deviation.to_raw_bits() < 0
@@ -158,7 +155,6 @@ impl AssetState {
 
         self.asset_id = asset_id;
         self.bump = bump;
-        self.governance_key = governance_key;
         self.status = ASSET_PENDING;
         self.price_model = price_model;
         self.decimals = decimals;
@@ -191,19 +187,8 @@ impl AssetState {
         Ok(())
     }
 
-    pub fn activate(
-        &mut self,
-        activation_window: &mut super::governance::ProposalWindow,
-        now: i64,
-    ) -> StateResult<()> {
-        if self.status != ASSET_PENDING {
-            return Err(StateError::InvalidStatus);
-        }
-
-        activation_window.consume(now)?;
+    pub fn activate(&mut self) {
         self.status = ASSET_ACTIVE;
-
-        Ok(())
     }
 
     pub fn is_active(&self) -> bool {
@@ -212,10 +197,6 @@ impl AssetState {
 
     pub fn is_pending(&self) -> bool {
         self.status == ASSET_PENDING
-    }
-
-    pub fn is_governance_key(&self, key: Pubkey) -> bool {
-        self.governance_key == key
     }
 
     pub fn has_custody(&self) -> bool {
@@ -299,54 +280,5 @@ impl AssetState {
             let account = feed_account.ok_or(StateError::InvalidReference)?;
             super::OracleObservation::from_pyth_account(account, self, now)
         }
-    }
-}
-
-/// Delayed authorization to withdraw booked protocol fees from one asset.
-/// The executable amount is computed from matured fee ledgers, not stored here.
-#[account]
-#[derive(Debug, InitSpace)]
-pub struct PendingProtocolFeeCollection {
-    pub asset: Pubkey,
-    pub destination: Pubkey,
-    pub rent_recipient: Pubkey,
-    pub window: super::ProposalWindow,
-}
-
-impl PendingProtocolFeeCollection {
-    pub const SPACE: usize = 8 + Self::INIT_SPACE;
-
-    pub fn initialize_in_place(
-        &mut self,
-        asset: Pubkey,
-        destination: Pubkey,
-        rent_recipient: Pubkey,
-        window: super::ProposalWindow,
-    ) -> StateResult<()> {
-        if asset == Pubkey::default()
-            || destination == Pubkey::default()
-            || rent_recipient == Pubkey::default()
-        {
-            return Err(StateError::InvalidConfiguration);
-        }
-
-        self.asset = asset;
-        self.destination = destination;
-        self.rent_recipient = rent_recipient;
-        self.window = window;
-
-        Ok(())
-    }
-
-    pub fn is_same_asset(&self, key: Pubkey) -> bool {
-        self.asset == key
-    }
-
-    pub fn is_same_destination(&self, key: Pubkey) -> bool {
-        self.destination == key
-    }
-
-    pub fn is_same_rent_recipient(&self, key: Pubkey) -> bool {
-        self.rent_recipient == key
     }
 }

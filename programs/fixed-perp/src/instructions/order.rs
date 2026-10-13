@@ -30,7 +30,7 @@ pub struct OrderAccounts<'info> {
     pub authority: Signer<'info>,
     #[account(mut, constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority)]
     pub subaccount: AccountLoader<'info, Subaccount>,
-    #[account(mut)]
+    #[account(mut, constraint = market.load()?.may_use_order() @ StateError::InvalidStatus)]
     pub market: AccountLoader<'info, MarketState>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
@@ -56,6 +56,7 @@ fn maker_accounts<'info>(
     for (index, info) in remaining.iter().enumerate() {
         let loader = AccountLoader::<Subaccount>::try_from(info)
             .map_err(|_| error!(StateError::InvalidAccountInfo))?;
+
         loaders[index] = Some(loader);
     }
 
@@ -258,14 +259,16 @@ fn execute_place_order<'info>(
         if maker_count == 0 {
             market.place_order(&mut subaccount, accounts.subaccount.key(), now, intent, &[])?;
         } else {
-            let first = maker_guards[0]
+
+            let first_key = maker_accounts[0].key();
+            let first_account = maker_guards[0]
                 .as_ref()
                 .ok_or(StateError::InvalidReference)?;
 
             let mut makers: [MakerSubaccount<'_>; MAX_ORDERS] =
                 core::array::from_fn(|_| MakerSubaccount {
-                    key: maker_accounts[0].key(),
-                    subaccount: first,
+                    key: first_key,
+                    subaccount: &first_account,
                 });
 
             for index in 0..maker_count {
@@ -356,6 +359,7 @@ fn execute_modify_order<'info>(
     args: ModifyOrderArgs,
 ) -> Result<()> {
     let mut subaccount = accounts.subaccount.load_mut()?;
+
     {
         let mut market = accounts.market.load_mut()?;
 

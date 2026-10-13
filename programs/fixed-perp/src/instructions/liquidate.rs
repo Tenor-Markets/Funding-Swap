@@ -32,7 +32,7 @@ pub struct Liquidate<'info> {
 pub struct Liquidation {
     pub liquidator: Pubkey,
     pub victim: Pubkey,
-    pub market_id: u32,
+    pub market_id: u64,
     pub size_to_liquidator: i64,
     pub incentive_atoms: i128,
     pub fee_atoms: u128,
@@ -40,7 +40,7 @@ pub struct Liquidation {
 
 pub fn handle_liquidate<'info>(
     context: Context<'info, Liquidate<'info>>,
-    market_id: u32,
+    market_id: u64,
     size_to_liquidator: i64,
 ) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;

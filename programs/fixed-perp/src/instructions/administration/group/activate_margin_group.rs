@@ -1,30 +1,23 @@
 use crate::state::*;
 use anchor_lang::prelude::*;
 
+/// Squads enforces approval and delay; resource activation only checks lifecycle prerequisites.
 #[derive(Accounts)]
 pub struct ActivateMarginGroup<'info> {
-    #[account(mut)]
-    pub margin_group: AccountLoader<'info, MarginGroup>,
+    pub authority: Signer<'info>,
     #[account(
-        mut,
-        constraint = margin_group.load()?.is_governance_key(margin_group_governance.key()) @ StateError::InvalidKey
+        constraint = global_governance.load()?.authority_for(GovernanceCategory::Resources, authority.key()) @ StateError::InvalidAuthority
     )]
-    pub margin_group_governance: AccountLoader<'info, MarginGroupGovernance>,
+    pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
+    #[account(
+        mut, 
+        constraint = margin_group.load()?.is_pending() @ StateError::InvalidStatus
+    )]
+    pub margin_group: AccountLoader<'info, MarginGroup>,
 }
 
 pub fn handle_activate_margin_group(context: Context<ActivateMarginGroup>) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
-
-    let mut group = context.accounts.margin_group.load_mut()?;
-
-    group.activate(
-        &mut context
-            .accounts
-            .margin_group_governance
-            .load_mut()?
-            .activation_window,
-        now,
-    )?;
+    context.accounts.margin_group.load_mut()?.activate();
 
     Ok(())
 }

@@ -23,10 +23,11 @@ pub fn handle_risky_order_cleanup<'info>(
     if context.remaining_accounts.is_empty() {
         return Ok(());
     }
+
     let now = Clock::get()?.unix_timestamp;
     let group = context.accounts.margin_group.load()?;
 
-    let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
+    let (observations, _) = read_observation_set::<{ crate::state::MAX_MARKETS }>(
         context.remaining_accounts,
         group.collateral_state,
         group.settlement_state,
@@ -205,6 +206,7 @@ pub fn handle_close_only_cleanup<'info>(
         let Some(slot_index) = subaccount.lookup_market(market.config.market_id) else {
             continue;
         };
+
         materialize_market(&mut subaccount, &mut market, slot_index)?;
 
         market.close_only_cleanup(&mut subaccount)?;

@@ -271,10 +271,10 @@ impl HierarchicalBitmap {
         self.level_zero[mapped / 64] & (1u64 << (mapped % 64)) != 0
     }
 
-    /// Returns the lowest occupied tick, or NotFound for an empty bitmap.
-    fn best_lowest(&self) -> StateResult<i16> {
+    /// Returns the lowest occupied tick, or None for an empty bitmap.
+    fn best_lowest(&self) -> Option<i16> {
         if self.top == 0 {
-            return Err(StateError::NotFound);
+            return None;
         }
 
         let upper_word = self.top.trailing_zeros() as usize;
@@ -285,13 +285,13 @@ impl HierarchicalBitmap {
 
         let mapped = word * 64 + level_zero.trailing_zeros() as usize;
 
-        Ok(tick_from_index(mapped))
+        Some(tick_from_index(mapped))
     }
 
-    /// Returns the highest occupied tick, or NotFound for an empty bitmap.
-    fn best_highest(&self) -> StateResult<i16> {
+    /// Returns the highest occupied tick, or None for an empty bitmap.
+    fn best_highest(&self) -> Option<i16> {
         if self.top == 0 {
-            return Err(StateError::NotFound);
+            return None;
         }
 
         let upper_word = 63 - self.top.leading_zeros() as usize;
@@ -302,7 +302,7 @@ impl HierarchicalBitmap {
 
         let mapped = word * 64 + (63 - level_zero.leading_zeros() as usize);
 
-        Ok(tick_from_index(mapped))
+        Some(tick_from_index(mapped))
     }
 }
 
@@ -611,22 +611,24 @@ impl OrderBook {
         self.free_node_head = index as u16;
     }
 
-    /// Returns the FIFO head at the best price on a side.
+    /// Returns the FIFO head at the best price, or None when the side is empty.
     /// Called with the maker side.
-    pub(crate) fn best_head(&self, side: Side) -> StateResult<usize> {
-        let tick = self.best_tick(side)?;
+    pub(crate) fn best_head(&self, side: Side) -> StateResult<Option<usize>> {
+        let Some(tick) = self.best_tick(side) else {
+            return Ok(None);
+        };
 
         // A live node always has metadata, we keep an explicit error instead of unwrapping.
         let metadata = self
             .get_metadata(side, tick)
             .ok_or(StateError::InvalidReference)?;
 
-        Ok(usize::from(self.tick_metadata[metadata].head))
+        Ok(Some(usize::from(self.tick_metadata[metadata].head)))
     }
 
-    /// Returns the best occupied tick for the requested side.
+    /// Returns the best occupied tick, or None when the requested side is empty.
     /// Called with the maker side.
-    pub(crate) fn best_tick(&self, side: Side) -> StateResult<i16> {
+    pub(crate) fn best_tick(&self, side: Side) -> Option<i16> {
         if side == Side::Long {
             self.long_bitmap.best_highest()
         } else {

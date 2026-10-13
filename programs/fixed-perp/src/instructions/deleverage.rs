@@ -14,6 +14,7 @@ use crate::state::{
 pub struct Deleverage<'info> {
     pub authority: Signer<'info>,
     #[account(
+        seeds = [b"governance"], bump = global_governance.load()?.bump,
         constraint = global_governance.load()?.authority_for(
             GovernanceCategory::Deleveraging,
             authority.key(),
@@ -39,7 +40,7 @@ pub struct Deleverage<'info> {
 pub struct ForcedDeleverage {
     pub winner: Pubkey,
     pub loser: Pubkey,
-    pub market_id: u32,
+    pub market_id: u64,
     pub size_to_winner: i64,
     pub alpha_raw: i128,
     pub loss_atoms: i128,
@@ -47,7 +48,7 @@ pub struct ForcedDeleverage {
 
 pub fn handle_deleverage<'info>(
     context: Context<'info, Deleverage<'info>>,
-    market_id: u32,
+    market_id: u64,
     size_to_winner: i64,
     alpha_raw: i128,
 ) -> Result<()> {
@@ -60,26 +61,48 @@ pub fn handle_deleverage<'info>(
         group.settlement_state,
         now,
     )?;
-    let entry = market_observation_for(&observations, market_id)?;
+    drop(group);
+    execute_deleverage(
+        context.accounts,
+        &observations,
+        now,
+        market_id,
+        size_to_winner,
+        alpha_raw,
+    )
+}
+
+// Keep the observation array in the caller's frame, as in the order handlers.
+#[inline(never)]
+fn execute_deleverage<'info>(
+    accounts: &Deleverage<'info>,
+    observations: &ObservationSet<'info, { MAX_MARKETS * 2 }>,
+    now: i64,
+    market_id: u64,
+    size_to_winner: i64,
+    alpha_raw: i128,
+) -> Result<()> {
+    let group = accounts.margin_group.load()?;
+    let entry = market_observation_for(observations, market_id)?;
     {
         let market = entry.loader.load()?;
         group.ensure_market_assets_match(&market)?;
     }
 
     {
-        let mut winner = context.accounts.winner.load_mut()?;
-        let mut loser = context.accounts.loser.load_mut()?;
-        materialize_entered(&mut winner, &observations)?;
-        materialize_entered(&mut loser, &observations)?;
+        let mut winner = accounts.winner.load_mut()?;
+        let mut loser = accounts.loser.load_mut()?;
+        materialize_entered(&mut winner, observations)?;
+        materialize_entered(&mut loser, observations)?;
     }
 
     {
-        let winner = context.accounts.winner.load()?;
-        let loser = context.accounts.loser.load()?;
+        let winner = accounts.winner.load()?;
+        let loser = accounts.loser.load()?;
         let winner_ratio =
-            maintenance_health(&group, &winner, &observations, now)?.maintenance_health_ratio()?;
+            maintenance_health(&group, &winner, observations, now)?.maintenance_health_ratio()?;
         let loser_ratio =
-            maintenance_health(&group, &loser, &observations, now)?.maintenance_health_ratio()?;
+            maintenance_health(&group, &loser, observations, now)?.maintenance_health_ratio()?;
         // The paper requires the winner to be strictly healthier. Boros checks
         // that outside the market, and this instruction is that caller.
         if winner_ratio.to_raw_bits() <= loser_ratio.to_raw_bits() {
@@ -88,13 +111,13 @@ pub fn handle_deleverage<'info>(
     }
 
     let loser_value = {
-        let loser = context.accounts.loser.load()?;
-        portfolio_settlement_value(&loser, &observations, now)?
+        let loser = accounts.loser.load()?;
+        portfolio_settlement_value(&loser, observations, now)?
     };
     let alpha = FixedPoint::from_raw_bits(alpha_raw);
     let loss = {
-        let mut winner = context.accounts.winner.load_mut()?;
-        let mut loser = context.accounts.loser.load_mut()?;
+        let mut winner = accounts.winner.load_mut()?;
+        let mut loser = accounts.loser.load_mut()?;
         let mut market = entry
             .loader
             .load_mut()
@@ -110,8 +133,8 @@ pub fn handle_deleverage<'info>(
     };
 
     emit!(ForcedDeleverage {
-        winner: context.accounts.winner.key(),
-        loser: context.accounts.loser.key(),
+        winner: accounts.winner.key(),
+        loser: accounts.loser.key(),
         market_id,
         size_to_winner,
         alpha_raw,

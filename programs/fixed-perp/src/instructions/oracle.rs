@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::state::{
     AssetState, FixedPoint, MarketState, OracleObservation, SettlementRatio, StateError,
-    MAX_MARKETS, PRICE_MODEL_FIXED,
+    MAX_MARKETS,
 };
 
 #[derive(Clone)]
@@ -15,7 +15,7 @@ pub(crate) struct AssetObservation<'info> {
 /// Pyth update.
 pub(crate) struct MarketObservation<'info> {
     pub(crate) loader: AccountLoader<'info, MarketState>,
-    pub(crate) market_id: u32,
+    pub(crate) market_id: u64,
     pub(crate) underlying: AssetObservation<'info>,
 }
 
@@ -57,7 +57,7 @@ pub(crate) fn read_asset_observation<'info>(
             return Err(error!(StateError::InvalidStatus));
         }
 
-        if asset.price_model.0 == PRICE_MODEL_FIXED {
+        if asset.price_model.is_fixed() {
             OracleObservation::fixed(&asset, now)?
         } else {
             let (feed_info, rest) = remaining
@@ -154,7 +154,7 @@ pub(crate) fn underlying_settlement_price(
 
 pub(crate) fn market_observation_for<'set, 'info, const N: usize>(
     observations: &'set ObservationSet<'info, N>,
-    market_id: u32,
+    market_id: u64,
 ) -> Result<&'set MarketObservation<'info>> {
     observations.markets[..observations.count]
         .iter()

@@ -42,6 +42,18 @@ impl PriceModel {
             _ => Err(StateError::InvalidTag),
         }
     }
+
+    pub fn is_fixed(&self) -> bool {
+        self.0 == PRICE_MODEL_FIXED
+    }
+
+    pub fn is_pegged(&self) -> bool {
+        self.0 == PRICE_MODEL_PEGGED
+    }
+
+    pub fn is_floating(&self) -> bool {
+        self.0 == PRICE_MODEL_FLOATING
+    }        
 }
 
 /// Exact positive rational used when a matured market converts settlement

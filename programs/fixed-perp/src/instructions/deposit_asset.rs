@@ -6,10 +6,18 @@ use crate::state::{AssetState, MarginGroup, StateError, Subaccount};
 #[derive(Accounts)]
 pub struct DepositAsset<'info> {
     pub depositor: Signer<'info>,
-    #[account(mut, token::mint = mint, token::authority = depositor)]
+    #[account(
+        mut, 
+        token::mint = mint, 
+        token::authority = depositor
+    )]
     pub source: Account<'info, TokenAccount>,
     pub mint: Account<'info, Mint>,
-    #[account(mut, token::mint = mint, token::authority = asset)]
+    #[account(
+        mut, 
+        token::mint = mint, 
+        token::authority = asset
+    )]
     pub token_vault: Account<'info, TokenAccount>,
     #[account(
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
@@ -21,7 +29,9 @@ pub struct DepositAsset<'info> {
         constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
-    #[account(mut, constraint = beneficiary.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID)]
+    #[account(
+        mut, 
+        constraint = beneficiary.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID)]
     pub beneficiary: AccountLoader<'info, Subaccount>,
     pub token_program: Program<'info, Token>,
 }

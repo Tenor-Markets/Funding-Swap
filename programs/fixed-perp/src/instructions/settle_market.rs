@@ -9,7 +9,10 @@ use crate::state::{
 #[derive(Accounts)]
 pub struct SettleMarketIntoCollateral<'info> {
     pub authority: Signer<'info>,
-    #[account(mut, constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority)]
+    #[account(
+        mut, 
+        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority
+    )]
     pub subaccount: AccountLoader<'info, Subaccount>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
@@ -23,7 +26,10 @@ pub struct SettleMarketIntoCollateral<'info> {
 #[derive(Accounts)]
 pub struct SettleAllMarketsIntoCollateral<'info> {
     pub authority: Signer<'info>,
-    #[account(mut, constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority)]
+    #[account(
+        mut, 
+        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority
+    )]
     pub subaccount: AccountLoader<'info, Subaccount>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
@@ -35,7 +41,10 @@ pub struct SettleAllMarketsIntoCollateral<'info> {
 #[derive(Accounts)]
 pub struct SettleMaturedMarkets<'info> {
     pub authority: Signer<'info>,
-    #[account(mut, constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority)]
+    #[account(
+        mut, 
+        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority
+    )]
     pub subaccount: AccountLoader<'info, Subaccount>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
@@ -46,6 +55,7 @@ pub struct SettleMaturedMarkets<'info> {
 
 fn slot_is_empty(subaccount: &Subaccount, slot_index: usize) -> bool {
     let slot = &subaccount.markets[slot_index];
+
     slot.position_size == 0 && slot.settlement_balance_atoms == 0 && slot.order_risk.is_empty()
 }
 
@@ -66,6 +76,7 @@ fn market_account_for_slot<'info>(
             return Ok(account_info);
         }
     }
+
     Err(StateError::InvalidMarket.into())
 }
 
@@ -82,6 +93,7 @@ fn prepare_market_settlement(
     ) {
         return Err(StateError::InvalidStatus);
     }
+
     // The group's price and collateral ledger are only meaningful for a market
     // that uses those same assets. This is the `ensure_market_assets_match` rule.
     if market.config.collateral_state != collateral_state
@@ -108,7 +120,9 @@ fn prepare_market_settlement(
     } else {
         return Ok(());
     };
+
     subaccount.settle_market_into_collateral(slot_index, market, ratio)?;
+
     Ok(())
 }
 
@@ -134,38 +148,43 @@ fn read_supplied_markets<'info>(
         loaders: core::array::from_fn(|_| None),
         count: 0,
     };
-    while supplied.count < MAX_MARKETS {
+
+    loop {
         let Some(account) = accounts.first() else {
             break;
         };
+
         let Ok(loader) = AccountLoader::<MarketState>::try_from(account) else {
             break;
         };
+
+        if supplied.count == MAX_MARKETS {
+            return Err(StateError::InvalidRemainingAccounts.into());
+        }
+
         accounts = &accounts[1..];
         supplied.loaders[supplied.count] = Some(loader);
         supplied.count += 1;
     }
-    if supplied.count == MAX_MARKETS
-        && accounts
-            .first()
-            .is_some_and(|account| AccountLoader::<MarketState>::try_from(account).is_ok())
-    {
-        return Err(StateError::InvalidRemainingAccounts.into());
-    }
+
     Ok((supplied, accounts))
 }
 
 fn reject_duplicate_markets(supplied: &SuppliedMarkets<'_>) -> Result<()> {
-    let mut market_ids = [0u32; MAX_MARKETS];
+    let mut market_ids = [0u64; MAX_MARKETS];
+
     for (index, loader) in supplied.loaders.iter().enumerate().take(supplied.count) {
         let loader = loader.as_ref().ok_or(StateError::InvalidMarket)?;
         let market = loader.load().map_err(|_| StateError::InvalidMarket)?;
         let market_id = market.config.market_id;
+
         if market_ids[..index].contains(&market_id) {
             return Err(StateError::InvalidRemainingAccounts.into());
         }
+
         market_ids[index] = market_id;
     }
+
     Ok(())
 }
 
@@ -179,12 +198,14 @@ pub fn handle_settle_market_into_collateral<'info>(
 ) -> Result<()> {
     let (collateral_state, settlement_state) = {
         let group = context.accounts.margin_group.load()?;
+
         (group.collateral_state, group.settlement_state)
     };
 
     let slot_index = {
         let subaccount = context.accounts.subaccount.load()?;
         let market = context.accounts.market.load()?;
+
         subaccount
             .lookup_market(market.config.market_id)
             .ok_or(StateError::InvalidMarket)?
@@ -193,6 +214,7 @@ pub fn handle_settle_market_into_collateral<'info>(
     {
         let mut subaccount = context.accounts.subaccount.load_mut()?;
         let mut market = context.accounts.market.load_mut()?;
+
         prepare_market_settlement(
             &mut subaccount,
             slot_index,
@@ -201,6 +223,7 @@ pub fn handle_settle_market_into_collateral<'info>(
             settlement_state,
         )?;
     }
+
     reject_unused_price_accounts(context.remaining_accounts)
 }
 
@@ -212,19 +235,25 @@ pub fn handle_settle_all_markets_into_collateral<'info>(
 ) -> Result<()> {
     let (collateral_state, settlement_state) = {
         let group = context.accounts.margin_group.load()?;
+
         (group.collateral_state, group.settlement_state)
     };
+
     let (supplied, extra_accounts) = read_supplied_markets(context.remaining_accounts)?;
+
     reject_duplicate_markets(&supplied)?;
     reject_unused_price_accounts(extra_accounts)?;
 
     let mut subaccount = context.accounts.subaccount.load_mut()?;
+
     for loader in supplied.loaders.iter().take(supplied.count) {
         let loader = loader.as_ref().ok_or(StateError::InvalidMarket)?;
         let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+
         let slot_index = subaccount
             .lookup_market(market.config.market_id)
             .ok_or(StateError::InvalidMarket)?;
+
         prepare_market_settlement(
             &mut subaccount,
             slot_index,
@@ -233,6 +262,7 @@ pub fn handle_settle_all_markets_into_collateral<'info>(
             settlement_state,
         )?;
     }
+
     Ok(())
 }
 
@@ -259,6 +289,7 @@ pub fn handle_settle_matured_markets<'info>(
             if !subaccount.markets[slot_index].order_risk.is_empty() {
                 market.close_all_orders(&mut subaccount, slot_index)?;
             }
+
             if slot_is_empty(&subaccount, slot_index) {
                 subaccount.close_market(slot_index, &mut market)?;
             } else {
@@ -266,5 +297,6 @@ pub fn handle_settle_matured_markets<'info>(
             }
         }
     }
+
     Ok(())
 }

@@ -22,18 +22,28 @@ pub struct CloseSubaccount<'info> {
         constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
-    #[account(constraint = asset.load()?.is_active() @ StateError::InvalidStatus)]
+    #[account(
+        constraint = asset.load()?.is_active() @ StateError::InvalidStatus
+    )]
     pub asset: AccountLoader<'info, AssetState>,
     pub mint: Account<'info, Mint>,
-    #[account(mut, token::mint = mint, token::authority = asset)]
+    #[account(
+        mut, 
+        token::mint = mint, 
+        token::authority = asset
+    )]
     pub token_account: Account<'info, TokenAccount>,
-    #[account(mut, token::mint = mint)]
+    #[account(
+        mut, 
+        token::mint = mint
+    )]
     pub destination: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 
 fn slot_is_empty(subaccount: &Subaccount, slot_index: usize) -> bool {
     let slot = &subaccount.markets[slot_index];
+
     slot.position_size == 0 && slot.settlement_balance_atoms == 0 && slot.order_risk.is_empty()
 }
 
@@ -43,14 +53,18 @@ fn market_account_for_slot<'info>(
     remaining_accounts: &'info [AccountInfo<'info>],
 ) -> Result<&'info AccountInfo<'info>> {
     let market_id = subaccount.markets[slot_index].market_id;
+
     for account_info in remaining_accounts {
         let loader = AccountLoader::<MarketState>::try_from(account_info)
             .map_err(|_| StateError::InvalidAccountInfo)?;
+
         let market = loader.load().map_err(|_| StateError::InvalidMarket)?;
+
         if market.config.market_id == market_id {
             return Ok(account_info);
         }
     }
+
     Err(StateError::InvalidMarket.into())
 }
 
@@ -61,15 +75,19 @@ fn close_subaccount_markets_from_accounts<'info>(
     remaining_accounts: &'info [AccountInfo<'info>],
 ) -> Result<bool> {
     let mut closed_count = 0;
+
     for slot_index in 0..MAX_MARKETS {
         if subaccount.markets[slot_index].market_id == 0 {
             closed_count += 1;
+
             continue;
         }
 
         let market_info = market_account_for_slot(subaccount, slot_index, remaining_accounts)?;
+
         let loader = AccountLoader::<MarketState>::try_from(market_info)
             .map_err(|_| StateError::InvalidAccountInfo)?;
+
         let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
 
         materialize_market(subaccount, &mut market, slot_index)?;
@@ -96,25 +114,32 @@ pub fn handle_close_subaccount<'info>(
     context: Context<'info, CloseSubaccount<'info>>,
 ) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
+
     let remaining_collateral = {
         let mut subaccount = context.accounts.subaccount.load_mut()?;
+
         let all_markets_empty =
             close_subaccount_markets_from_accounts(&mut subaccount, context.remaining_accounts)?;
+
         if !all_markets_empty {
             return Err(StateError::MarketsNotEmpty.into());
         }
+
         if subaccount.collateral_balance_atoms < 0 {
             return Err(StateError::NegativeCollateralBalance.into());
         }
+
         u64::try_from(subaccount.collateral_balance_atoms)
             .map_err(|_| StateError::ArithmeticOverflow)?
     };
 
     let (asset_id, bump) = {
         let asset = context.accounts.asset.load()?;
+
         if !asset.is_valid_custody(context.accounts.token_account.key()) {
             return Err(StateError::InvalidTargetCustody.into());
         }
+
         (asset.asset_id, asset.bump)
     };
 

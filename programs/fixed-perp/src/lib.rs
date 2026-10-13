@@ -42,12 +42,6 @@ pub mod fixed_perp {
         )
     }
 
-    pub fn allocate_market(context: Context<AllocateMarket>, market_id: u32) -> Result<()> {
-        instructions::administration::market::allocate_market::handle_allocate_market(
-            context, market_id,
-        )
-    }
-
     pub fn initialize_market(
         context: Context<InitializeMarket>,
         args: CreateMarketArgs,
@@ -114,7 +108,7 @@ pub mod fixed_perp {
 
     pub fn liquidate<'info>(
         context: Context<'info, Liquidate<'info>>,
-        market_id: u32,
+        market_id: u64,
         size_to_liquidator: i64,
     ) -> Result<()> {
         instructions::liquidate::handle_liquidate(context, market_id, size_to_liquidator)
@@ -122,7 +116,7 @@ pub mod fixed_perp {
 
     pub fn deleverage<'info>(
         context: Context<'info, Deleverage<'info>>,
-        market_id: u32,
+        market_id: u64,
         size_to_winner: i64,
         alpha_raw: i128,
     ) -> Result<()> {
@@ -182,14 +176,8 @@ pub mod fixed_perp {
         instructions::refresh_market::handle_refresh_market(context)
     }
 
-    pub fn seed_market_source<'info>(context: Context<'info, RefreshMarket<'info>>) -> Result<()> {
+    pub fn seed_market_source<'info>(context: Context<'info, SeedMarketSource<'info>>) -> Result<()> {
         instructions::refresh_market::handle_seed_market_source(context)
-    }
-
-    pub fn propose_market_group_membership(
-        context: Context<ProposeMarketGroupMembership>,
-    ) -> Result<()> {
-        instructions::administration::market::propose_market_group_membership::handle_propose_market_group_membership(context)
     }
 
     pub fn activate_market_group_membership(
@@ -202,135 +190,94 @@ pub mod fixed_perp {
         instructions::administration::vault::activate_asset::handle_activate_asset(context)
     }
 
-    pub fn execute_market_governance(
-        context: Context<ExecuteMarketGovernance>,
-        category: u8,
+    pub fn tighten_market_risk(
+        context: Context<TightenMarketRisk>,
+        args: state::UpdateMarketRiskArgs,
     ) -> Result<()> {
-        instructions::administration::market::execute_market_governance::handle_execute_market_governance(context, category)
-    }
-
-    pub fn propose_global_governance(
-        context: Context<ProposeGlobalGovernance>,
-        args: GlobalGovernanceArgs,
-    ) -> Result<()> {
-        instructions::administration::global::propose_global_governance::handle_propose_global_governance(context, args)
-    }
-
-    pub fn cancel_global_governance(context: Context<CancelGlobalGovernance>) -> Result<()> {
-        instructions::administration::global::cancel_global_governance::handle_cancel_global_governance(context)
-    }
-
-    pub fn execute_global_governance(context: Context<ExecuteGlobalGovernance>) -> Result<()> {
-        instructions::administration::global::execute_global_governance::handle_execute_global_governance(context)
-    }
-
-    pub fn propose_market_margin(
-        context: Context<ProposeMarketMargin>,
-        args: MarketMarginGovernanceArgs,
-    ) -> Result<()> {
-        instructions::administration::market::propose_market_margin::handle_propose_market_margin(
+        instructions::administration::market::tighten_market_risk::handle_tighten_market_risk(
             context, args,
         )
     }
 
-    pub fn propose_group_margin(
-        context: Context<ProposeGroupMargin>,
-        args: GroupMarginGovernanceArgs,
+    pub fn relax_market_risk(
+        context: Context<RelaxMarketRisk>,
+        args: state::UpdateMarketRiskArgs,
     ) -> Result<()> {
-        instructions::administration::group::propose_group_margin::handle_propose_group_margin(
+        instructions::administration::market::relax_market_risk::handle_relax_market_risk(
             context, args,
         )
     }
 
-    pub fn propose_liquidation(
-        context: Context<ProposeLiquidation>,
-        args: LiquidationGovernanceArgs,
+    pub fn tighten_group_risk(
+        context: Context<TightenGroupRisk>,
+        args: state::UpdateGroupRiskArgs,
     ) -> Result<()> {
-        instructions::administration::market::propose_liquidation::handle_propose_liquidation(
+        instructions::administration::group::tighten_group_risk::handle_tighten_group_risk(
             context, args,
         )
     }
 
-    pub fn propose_fee_rate(
-        context: Context<ProposeFeeRate>,
-        args: FeeRateGovernanceArgs,
+    pub fn relax_group_risk(
+        context: Context<RelaxGroupRisk>,
+        args: state::UpdateGroupRiskArgs,
     ) -> Result<()> {
-        instructions::administration::market::propose_fee_rate::handle_propose_fee_rate(
+        instructions::administration::group::relax_group_risk::handle_relax_group_risk(
             context, args,
         )
     }
 
-    pub fn propose_market_risk(
-        context: Context<ProposeMarketRisk>,
-        args: MarketRiskGovernanceArgs,
+    pub fn tighten_withdrawal_limits(
+        context: Context<TightenWithdrawalLimits>,
+        args: state::UpdateWithdrawalLimitsArgs,
     ) -> Result<()> {
-        instructions::administration::market::propose_market_risk::handle_propose_market_risk(
+        instructions::administration::vault::tighten_withdrawal_limits::handle_tighten_withdrawal_limits(context, args)
+    }
+
+    pub fn raise_withdrawal_limits(
+        context: Context<RaiseWithdrawalLimits>,
+        args: state::UpdateWithdrawalLimitsArgs,
+    ) -> Result<()> {
+        instructions::administration::vault::raise_withdrawal_limits::handle_raise_withdrawal_limits(
             context, args,
         )
     }
 
-    pub fn propose_market_status(
-        context: Context<ProposeMarketStatus>,
-        args: MarketStatusGovernanceArgs,
+    pub fn update_fees_and_liquidation(
+        context: Context<UpdateFeesAndLiquidation>,
+        args: state::UpdateFeesAndLiquidationArgs,
     ) -> Result<()> {
-        instructions::administration::market::propose_market_status::handle_propose_market_status(
+        instructions::administration::market::update_fees_and_liquidation::handle_update_fees_and_liquidation(context, args)
+    }
+
+    pub fn restrict_market_status(
+        context: Context<RestrictMarketStatus>,
+        status: u8,
+    ) -> Result<()> {
+        instructions::administration::market::restrict_market_status::handle_restrict_market_status(
+            context, status,
+        )
+    }
+
+    pub fn restore_market_status(context: Context<RestoreMarketStatus>, status: u8) -> Result<()> {
+        instructions::administration::market::restore_market_status::handle_restore_market_status(
+            context, status,
+        )
+    }
+
+    pub fn update_authorities(
+        context: Context<UpdateAuthorities>,
+        args: state::UpdateAuthoritiesArgs,
+    ) -> Result<()> {
+        instructions::administration::global::update_authorities::handle_update_authorities(
             context, args,
         )
     }
 
-    pub fn propose_asset_circuit_breaker(
-        context: Context<ProposeAssetCircuitBreaker>,
-        args: CircuitBreakerGovernanceArgs,
+    pub fn collect_protocol_fees<'info>(
+        context: Context<'info, CollectProtocolFees<'info>>,
     ) -> Result<()> {
-        instructions::administration::vault::propose_asset_circuit_breaker::handle_propose_asset_circuit_breaker(
-            context, args,
-        )
-    }
-
-    pub fn execute_margin_group_governance(
-        context: Context<ExecuteMarginGroupGovernance>,
-    ) -> Result<()> {
-        instructions::administration::group::execute_margin_group_governance::handle_execute_margin_group_governance(context)
-    }
-
-    pub fn execute_asset_governance(context: Context<ExecuteAssetGovernance>) -> Result<()> {
-        instructions::administration::vault::execute_asset_governance::handle_execute_asset_governance(context)
-    }
-
-    pub fn cancel_market_governance(
-        context: Context<CancelMarketGovernance>,
-        category: u8,
-    ) -> Result<()> {
-        instructions::administration::market::cancel_market_governance::handle_cancel_market_governance(context, category)
-    }
-
-    pub fn cancel_margin_group_governance(
-        context: Context<CancelMarginGroupGovernance>,
-    ) -> Result<()> {
-        instructions::administration::group::cancel_margin_group_governance::handle_cancel_margin_group_governance(context)
-    }
-
-    pub fn cancel_asset_governance(context: Context<CancelAssetGovernance>) -> Result<()> {
-        instructions::administration::vault::cancel_asset_governance::handle_cancel_asset_governance(
+        instructions::administration::vault::collect_protocol_fees::handle_collect_protocol_fees(
             context,
         )
-    }
-
-    pub fn propose_protocol_fee_collection(
-        context: Context<ProposeProtocolFeeCollection>,
-    ) -> Result<()> {
-        instructions::administration::vault::propose_protocol_fee_collection::handle_propose_protocol_fee_collection(context)
-    }
-
-    pub fn cancel_protocol_fee_collection(
-        context: Context<CancelProtocolFeeCollection>,
-    ) -> Result<()> {
-        instructions::administration::vault::cancel_protocol_fee_collection::handle_cancel_protocol_fee_collection(context)
-    }
-
-    pub fn execute_protocol_fee_collection<'info>(
-        context: Context<'info, ExecuteProtocolFeeCollection<'info>>,
-    ) -> Result<()> {
-        instructions::administration::vault::execute_protocol_fee_collection::handle_execute_protocol_fee_collection(context)
     }
 }

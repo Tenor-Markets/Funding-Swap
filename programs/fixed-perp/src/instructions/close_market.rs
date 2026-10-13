@@ -1,6 +1,4 @@
-use crate::state::{
-    GlobalGovernanceConfig, GovernanceCategory, MarketGovernance, MarketState, StateError,
-};
+use crate::state::{GlobalGovernanceConfig, GovernanceCategory, MarketState, StateError};
 use anchor_lang::prelude::*;
 
 fn is_zero(num: u32) -> bool {
@@ -11,7 +9,7 @@ fn is_zero(num: u32) -> bool {
 pub struct CloseMarket<'info> {
     pub authority: Signer<'info>,
     #[account(
-        constraint = global_governance.load()?.authority_for(GovernanceCategory::Creation, authority.key()) @ StateError::InvalidAuthority
+        constraint = global_governance.load()?.authority_for(GovernanceCategory::Resources, authority.key()) @ StateError::InvalidAuthority
     )]
     pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
     #[account(
@@ -20,13 +18,7 @@ pub struct CloseMarket<'info> {
         constraint = is_zero(market.load()?.subaccount_count) @ StateError::Conflict
     )]
     pub market: AccountLoader<'info, MarketState>,
-    #[account(
-        mut,
-        close = rent_recipient,
-        constraint = market.load()?.is_governance_key(market_governance.key()) @ StateError::InvalidKey,
-    )]
-    pub market_governance: AccountLoader<'info, MarketGovernance>,
-    /// CHECK: Receives rent from both closed protocol accounts.
+    /// CHECK: Receives rent from the closed market.
     #[account(mut)]
     pub rent_recipient: UncheckedAccount<'info>,
 }

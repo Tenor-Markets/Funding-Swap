@@ -92,23 +92,29 @@ fn validate_withdraw_health<'info>(
 ) -> Result<()> {
     let mut market_guards: [Option<Ref<'_, MarketState>>; MAX_MARKETS] =
         core::array::from_fn(|_| None);
+
     let mut underlying_guards: [Option<Ref<'_, AssetState>>; MAX_MARKETS] =
         core::array::from_fn(|_| None);
+
     let collateral_guard = observations.collateral.loader.load()?;
     let settlement_guard = observations.settlement.loader.load()?;
 
     let mut portfolio: [Option<PortfolioMarketObservation<'_>>; MAX_MARKETS] = [None; MAX_MARKETS];
+
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
         if slot.market_id == 0 {
             continue;
         }
+
         let entry = market_observation_for(observations, slot.market_id)?;
+
         market_guards[slot_index] = Some(
             entry
                 .loader
                 .load()
                 .map_err(|_| error!(StateError::InvalidReference))?,
         );
+
         underlying_guards[slot_index] = Some(
             entry
                 .underlying
@@ -117,23 +123,29 @@ fn validate_withdraw_health<'info>(
                 .map_err(|_| error!(StateError::InvalidReference))?,
         );
     }
+
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
         if slot.market_id == 0 {
             continue;
         }
+
         let entry = market_observation_for(observations, slot.market_id)?;
+
         let market = market_guards[slot_index]
             .as_ref()
             .ok_or(StateError::InvalidReference)?;
+
         let underlying_asset = underlying_guards[slot_index]
             .as_ref()
             .ok_or(StateError::InvalidReference)?;
+
         portfolio[slot_index] = Some(PortfolioMarketObservation {
             market,
             underlying_asset,
             underlying: entry.underlying.observation,
         });
     }
+
     let amount_i128 = i128::from(amount);
 
     subaccount.collateral_balance_atoms = subaccount
@@ -154,6 +166,7 @@ fn validate_withdraw_health<'info>(
     if !health.strict_im_met()? {
         return Err(error!(StateError::InsufficientInitialMargin));
     }
+
     Ok(())
 }
 
@@ -163,20 +176,23 @@ pub fn handle_withdraw_asset<'info>(
 ) -> Result<()> {
     if amount != 0 {
         let now = Clock::get()?.unix_timestamp;
+
         let (asset_id, bump) = {
             let asset = context.accounts.asset.load()?;
             (asset.asset_id, asset.bump)
         };
 
         {
-            let mut subaccount = context.accounts.subaccount.load_mut()?;
             let group = context.accounts.margin_group.load()?;
+            let mut subaccount = context.accounts.subaccount.load_mut()?;
+
             let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
                 context.remaining_accounts,
                 group.collateral_state,
                 group.settlement_state,
                 now,
             )?;
+
             settle_markets_from_observations(&mut subaccount, &observations)?;
             validate_withdraw_health(&group, &mut subaccount, &observations, amount, now)?;
         }

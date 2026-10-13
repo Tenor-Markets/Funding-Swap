@@ -69,6 +69,7 @@ pub fn handle_create_subaccount(
             subaccount_id,
             group_id,
         )?;
+
     context.accounts.margin_group.load_mut()?.add_subaccount()?;
 
     Ok(())

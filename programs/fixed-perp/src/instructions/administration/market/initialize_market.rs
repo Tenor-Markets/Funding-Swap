@@ -4,44 +4,44 @@ use anchor_lang::prelude::*;
 use bytemuck::Zeroable;
 
 #[derive(Accounts)]
-#[instruction(args: CreateMarketArgs)]
 pub struct InitializeMarket<'info> {
-    #[account(mut)]
     pub authority: Signer<'info>,
-    #[account(constraint = global_governance.load()?.authority_for(GovernanceCategory::Creation, authority.key()) @ StateError::InvalidAuthority)]
+    #[account(
+        mut,
+        constraint = global_governance.load()?.authority_for(GovernanceCategory::Resources, authority.key()) @ StateError::InvalidAuthority
+    )]
     pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
     #[account(
         zero,
-        seeds = [b"market_state", args.market_id.to_le_bytes().as_ref()],
-        bump
+        constraint = market.to_account_info().data_len() >= MarketState::SPACE @ StateError::InvalidAccountLength
     )]
     pub market: AccountLoader<'info, MarketState>,
-    #[account(
-        init,
-        payer = authority,
-        space = MarketGovernance::SPACE,
-        seeds = [b"market_governance", market.key().as_ref()],
-        bump
-    )]
-    pub market_governance: AccountLoader<'info, MarketGovernance>,
     #[account(constraint = collateral_state.load()?.is_active() @ StateError::InvalidStatus)]
     pub collateral_state: AccountLoader<'info, AssetState>,
     #[account(constraint = settlement_state.load()?.is_active() @ StateError::InvalidStatus)]
     pub settlement_state: AccountLoader<'info, AssetState>,
     #[account(constraint = underlying_state.load()?.is_active() @ StateError::InvalidStatus)]
     pub underlying_state: AccountLoader<'info, AssetState>,
-    pub system_program: Program<'info, System>,
 }
 
 pub fn handle_initialize_market(
     context: Context<InitializeMarket>,
     args: CreateMarketArgs,
 ) -> Result<()> {
-    // Context binds the zeroed market, governance, and all three immutable
-    // AssetState accounts before configuration is initialized.
     let now = Clock::get()?.unix_timestamp;
-    let global = context.accounts.global_governance.load()?;
+
+    let mut global = context.accounts.global_governance.load_mut()?;
+
+    let market_id = global.next_market_id;
+
+    let next_market_id = market_id
+        .checked_add(1)
+        .ok_or(StateError::ArithmeticOverflow)?;
+
+    global.next_market_id = next_market_id;
+
     let mut adapter = VenueAdapterConfig::default();
+
     match args.adapter {
         MarketAdapterArgs::Jupiter {
             max_source_delta,
@@ -51,6 +51,7 @@ pub fn handle_initialize_market(
             max_source_age_seconds,
         } => {
             adapter.kind = VenueAdapterKind(ADAPTER_JUPITER);
+
             *adapter.jupiter_mut()? = JupiterAdapterPayload {
                 max_source_delta,
                 custody,
@@ -78,6 +79,7 @@ pub fn handle_initialize_market(
             base_lot_decimals,
         } => {
             adapter.kind = VenueAdapterKind(ADAPTER_PHOENIX);
+
             *adapter.phoenix_mut()? = PhoenixAdapterPayload {
                 max_abs_native_delta,
                 global_configuration,
@@ -100,6 +102,7 @@ pub fn handle_initialize_market(
     }
 
     let mut config = MarketConfig::zeroed();
+
     config.initialize_in_place(
         args.hard_gross_open_interest_cap_atoms,
         args.start_timestamp,
@@ -121,29 +124,24 @@ pub fn handle_initialize_market(
         FixedPoint::from_raw_bits(args.liquidation_base_incentive_raw),
         FixedPoint::from_raw_bits(args.liquidation_incentive_slope_raw),
         FixedPoint::from_raw_bits(args.liquidation_fee_rate_raw),
-        args.market_id,
+        market_id,
         args.mark_observation_window_seconds,
         args.margin_time_threshold_seconds,
         args.tick_scale,
         context.accounts.underlying_state.load()?.decimals,
         context.accounts.settlement_state.load()?.decimals,
     )?;
+
     let mut market = context.accounts.market.load_init()?;
+
     market.initialize_in_place(
-        context.bumps.market,
         config,
         now,
         args.tick_step,
         args.minimum_order_size_atoms,
         args.maximum_order_size_atoms,
         args.maximum_open_orders_per_subaccount,
-        context.accounts.market_governance.key(),
     )?;
 
-    context
-        .accounts
-        .market_governance
-        .load_init()?
-        .initialize_in_place(creation_window(&global, now)?)?;
     Ok(())
 }
