@@ -14,7 +14,7 @@ pub struct Liquidate<'info> {
     pub liquidator_authority: Signer<'info>,
     #[account(
         mut,
-        constraint = liquidator.load()?.is_authority(liquidator_authority.key()) @ StateError::InvalidAuthority,
+        constraint = liquidator.load()?.is_authority_or_delegate(liquidator_authority.key()) @ StateError::InvalidAuthority,
         constraint = liquidator.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID
     )]
     pub liquidator: AccountLoader<'info, Subaccount>,

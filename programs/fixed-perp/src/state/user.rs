@@ -111,6 +111,13 @@ impl Subaccount {
         self.authority == authority
     }
 
+    /// Delegation grants the same operational permissions, including withdrawals
+    /// and subaccount closure. Only the owner can change the delegate.
+    pub fn is_authority_or_delegate(&self, authority: Pubkey) -> bool {
+        self.is_authority(authority)
+            || (self.delegate != Pubkey::default() && self.delegate == authority)
+    }
+
     pub fn is_same_group_id(&self, group_id: u16) -> bool {
         self.group_id == group_id
     }

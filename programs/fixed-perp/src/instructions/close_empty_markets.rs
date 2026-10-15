@@ -7,7 +7,7 @@ pub struct CloseEmptyMarkets<'info> {
     pub authority: Signer<'info>,
     #[account(
         mut,
-        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority
+        constraint = subaccount.load()?.is_authority_or_delegate(authority.key()) @ StateError::InvalidAuthority
     )]
     pub subaccount: AccountLoader<'info, Subaccount>,
 }

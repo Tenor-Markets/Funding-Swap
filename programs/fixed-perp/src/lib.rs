@@ -17,6 +17,7 @@ pub use instructions::materialize_subaccount::*;
 pub use instructions::order::*;
 pub use instructions::refresh_market::*;
 pub use instructions::settle_market::*;
+pub use instructions::update_delegate::*;
 pub use instructions::withdraw_asset::*;
 
 declare_id!("7NcM5j4x6ZW9yGeryVxKp5SVrUtpFdLcUYKYK4SX8i8K");
@@ -27,6 +28,10 @@ pub mod fixed_perp {
 
     pub fn create_subaccount(context: Context<CreateSubaccount>, subaccount_id: u16) -> Result<()> {
         instructions::create_subaccount::handle_create_subaccount(context, subaccount_id)
+    }
+
+    pub fn update_delegate(context: Context<UpdateDelegate>, delegate: Pubkey) -> Result<()> {
+        instructions::update_delegate::handle_update_delegate(context, delegate)
     }
 
     pub fn create_asset(context: Context<CreateAsset>, args: CreateAssetArgs) -> Result<()> {

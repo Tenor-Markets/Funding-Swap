@@ -11,7 +11,7 @@ pub struct CloseSubaccount<'info> {
     #[account(
         mut,
         close = authority,
-        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority,
+        constraint = subaccount.load()?.is_authority_or_delegate(authority.key()) @ StateError::InvalidAuthority,
         constraint = subaccount.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID,
 
     )]

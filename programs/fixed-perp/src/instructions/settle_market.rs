@@ -8,11 +8,7 @@ use crate::state::{
 
 #[derive(Accounts)]
 pub struct SettleMarketIntoCollateral<'info> {
-    pub authority: Signer<'info>,
-    #[account(
-        mut, 
-        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority
-    )]
+    #[account(mut)]
     pub subaccount: AccountLoader<'info, Subaccount>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
@@ -25,11 +21,7 @@ pub struct SettleMarketIntoCollateral<'info> {
 
 #[derive(Accounts)]
 pub struct SettleAllMarketsIntoCollateral<'info> {
-    pub authority: Signer<'info>,
-    #[account(
-        mut, 
-        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority
-    )]
+    #[account(mut)]
     pub subaccount: AccountLoader<'info, Subaccount>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
@@ -40,11 +32,7 @@ pub struct SettleAllMarketsIntoCollateral<'info> {
 
 #[derive(Accounts)]
 pub struct SettleMaturedMarkets<'info> {
-    pub authority: Signer<'info>,
-    #[account(
-        mut, 
-        constraint = subaccount.load()?.is_authority(authority.key()) @ StateError::InvalidAuthority
-    )]
+    #[account(mut)]
     pub subaccount: AccountLoader<'info, Subaccount>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,

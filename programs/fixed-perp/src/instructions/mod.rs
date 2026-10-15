@@ -13,6 +13,7 @@ pub(crate) mod oracle;
 pub mod order;
 pub mod refresh_market;
 pub mod settle_market;
+pub mod update_delegate;
 pub mod withdraw_asset;
 
 pub use administration::*;
@@ -28,3 +29,4 @@ pub use refresh_market::RefreshMarket;
 pub use settle_market::{
     SettleAllMarketsIntoCollateral, SettleMarketIntoCollateral, SettleMaturedMarkets,
 };
+pub use update_delegate::UpdateDelegate;
