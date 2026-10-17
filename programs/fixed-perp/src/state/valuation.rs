@@ -288,18 +288,7 @@ fn scale_signed_power(
 }
 
 fn ten_pow(exponent: u32) -> StateResult<u128> {
-    if exponent > 38 {
-        return Err(StateError::ArithmeticOverflow);
-    }
-
-    let mut value = 1u128;
-
-    for _ in 0..exponent {
-        value = value
-            .checked_mul(10)
-            .ok_or(StateError::ArithmeticOverflow)?;
-    }
-    Ok(value)
+    fixed_perp_math::pow10(exponent).ok_or(StateError::ArithmeticOverflow)
 }
 
 /// The authenticated, transient observation used by health and settlement.
@@ -459,9 +448,9 @@ impl OracleObservation {
 
         asset.validate_feed(message.feed_id)?;
 
-        let price = scale_pyth_value(message.price as i128, message.exponent)?;
-        let confidence = scale_pyth_value(message.conf as i128, message.exponent)?;
-        let ema = scale_pyth_value(message.ema_price as i128, message.exponent)?;
+        let price = scale_pyth_value(i128::from(message.price), message.exponent)?;
+        let confidence = scale_pyth_value(i128::from(message.conf), message.exponent)?;
+        let ema = scale_pyth_value(i128::from(message.ema_price), message.exponent)?;
 
         let lower = FixedPoint::from_raw_bits(
             price
@@ -534,24 +523,27 @@ fn scale_pyth_value(mantissa: i128, exponent: i32) -> StateResult<FixedPoint> {
         return Err(StateError::InvalidConfiguration);
     }
 
-    let mut value =
+    let value =
         fixed::types::I64F64::checked_from_num(mantissa).ok_or(StateError::ArithmeticOverflow)?;
+    let raw = u128::try_from(value.to_bits()).map_err(|_| StateError::ArithmeticOverflow)?;
 
-    if exponent >= 0 {
-        for _ in 0..u32::try_from(exponent).map_err(|_| StateError::ArithmeticOverflow)? {
-            value = value
-                .checked_mul(fixed::types::I64F64::from_num(10))
-                .ok_or(StateError::ArithmeticOverflow)?;
-        }
-    } else {
-        for _ in 0..exponent.unsigned_abs() {
-            value = value
-                .checked_div(fixed::types::I64F64::from_num(10))
-                .ok_or(StateError::ArithmeticOverflow)?;
-        }
+    if raw == 0 {
+        return Ok(FixedPoint::default());
     }
 
-    Ok(FixedPoint::from_i64f64(value))
+    let factor = fixed_perp_math::pow10(exponent.unsigned_abs());
+    let scaled = if exponent >= 0 {
+        raw.checked_mul(factor.ok_or(StateError::ArithmeticOverflow)?)
+            .ok_or(StateError::ArithmeticOverflow)?
+    } else {
+        // 10^39 exceeds every positive Q64.64 raw value, so larger negative
+        // exponents underflow to zero, just as repeated division does.
+        factor.map_or(0, |factor| raw / factor)
+    };
+
+    Ok(FixedPoint::from_raw_bits(
+        i128::try_from(scaled).map_err(|_| StateError::ArithmeticOverflow)?,
+    ))
 }
 
 /// Sign-directed valuation factors.

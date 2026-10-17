@@ -56,8 +56,8 @@ impl OrderRef {
     /// Creates a reference from slot and node indices validated by the market transition.
     pub(crate) fn new(slot_index: usize, node_index: usize) -> Self {
         Self {
-            slot_index: slot_index as u8,
-            node_index: node_index as u16,
+            slot_index: u8::try_from(slot_index).expect("validated market slot index"),
+            node_index: u16::try_from(node_index).expect("validated book node index"),
             ..Self::zeroed()
         }
     }
@@ -310,7 +310,7 @@ impl Subaccount {
     pub(crate) fn add_order_ref(&mut self, reference: OrderRef) {
         let index = usize::from(self.order_ref_count);
         self.order_refs[index] = reference;
-        self.order_ref_count = (index + 1) as u8;
+        self.order_ref_count = u8::try_from(index + 1).expect("bounded order reference count");
     }
 
     /// Swap-removes a validated live reference and clears the vacated tail.
@@ -319,7 +319,7 @@ impl Subaccount {
         let last = count - 1;
         self.order_refs[index] = self.order_refs[last];
         self.order_refs[last] = OrderRef::zeroed();
-        self.order_ref_count = last as u8;
+        self.order_ref_count = u8::try_from(last).expect("bounded order reference count");
     }
 
     /// Returns the live reference prefix; `order_ref_count` is maintained by add/remove.
@@ -364,13 +364,10 @@ impl OrderRiskAggregate {
         let effective_raw = rate_raw.max(floor_raw);
 
         let scale = |decimals: u8| -> StateResult<fixed::types::I64F64> {
-            let mut value = fixed::types::I64F64::ONE;
-            for _ in 0..decimals {
-                value = value
-                    .checked_mul(fixed::types::I64F64::from_num(10))
-                    .ok_or(StateError::ArithmeticOverflow)?;
-            }
-            Ok(value)
+            let value = fixed_perp_math::pow10(u32::from(decimals))
+                .ok_or(StateError::ArithmeticOverflow)?;
+
+            fixed::types::I64F64::checked_from_num(value).ok_or(StateError::ArithmeticOverflow)
         };
 
         let size =

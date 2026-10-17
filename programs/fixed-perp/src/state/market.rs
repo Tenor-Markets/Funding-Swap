@@ -16,14 +16,9 @@ use super::{
 pub use fixed_perp_math::rate::SECONDS_PER_YEAR;
 
 fn decimal_scale(decimals: u8) -> StateResult<I64F64> {
-    let mut scale = I64F64::ONE;
-
-    for _ in 0..decimals {
-        scale = scale
-            .checked_mul(I64F64::from_num(10))
-            .ok_or(StateError::ArithmeticOverflow)?;
-    }
-    Ok(scale)
+    let scale =
+        fixed_perp_math::pow10(u32::from(decimals)).ok_or(StateError::ArithmeticOverflow)?;
+    I64F64::checked_from_num(scale).ok_or(StateError::ArithmeticOverflow)
 }
 
 /// Signed division that rounds away from zero when the remainder is nonzero
@@ -68,6 +63,30 @@ pub struct PortfolioMarketObservation<'a> {
     pub market: &'a MarketState,
     pub underlying_asset: &'a AssetState,
     pub underlying: OracleObservation,
+}
+
+impl PortfolioMarketObservation<'_> {
+    /// Matching assets have an exact unit cross-rate. Settlement-to-value
+    /// conversion still applies its conservative price separately.
+    fn conservative_underlying_settlement_price(
+        &self,
+        settlement_price: FixedPoint,
+        endpoint: PriceEndpoint,
+    ) -> StateResult<FixedPoint> {
+        if self.market.config.underlying_state == self.market.config.settlement_state {
+            return Ok(FixedPoint::from_i64f64(I64F64::ONE));
+        }
+
+        let underlying_price = self
+            .underlying
+            .conservative_price_for(self.underlying_asset, endpoint)?;
+        let cross_rate = underlying_price
+            .to_i64f64()
+            .checked_div(settlement_price.to_i64f64())
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        Ok(FixedPoint::from_i64f64(cross_rate))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1999,7 +2018,10 @@ impl MarketState {
         )?;
 
         subaccount.markets[slot_index].order_risk = next_risk;
-        subaccount.add_order_ref(OrderRef::new(slot_index, order_id.slab_index as usize));
+        subaccount.add_order_ref(OrderRef::new(
+            slot_index,
+            usize::try_from(order_id.slab_index).map_err(|_| StateError::ArithmeticOverflow)?,
+        ));
 
         Ok(order_id)
     }
@@ -2016,7 +2038,7 @@ impl MarketState {
         slot_index: usize,
         order_id: OrderId,
     ) -> Option<usize> {
-        if order_id.slab_index >= BOOK_CAPACITY as u64 {
+        if order_id.slab_index >= u64::try_from(BOOK_CAPACITY).ok()? {
             return None;
         }
 
@@ -3652,7 +3674,6 @@ impl MarginGroup {
 
             let observation = markets_by_slot[slot_index].ok_or(StateError::NotFound)?;
             let market = observation.market;
-            let underlying_asset = observation.underlying_asset;
 
             let time = market
                 .config
@@ -3669,16 +3690,11 @@ impl MarginGroup {
             // then conservatively rounded at the settlement-atom boundary.
             let position_endpoint = PriceEndpoint::for_signed_value(position_value);
 
-            let underlying_price = observation
-                .underlying
-                .conservative_price_for(underlying_asset, position_endpoint)?;
             let settlement_price = settlement_observation
                 .conservative_price_for(settlement_asset, position_endpoint)?;
-            let cross_rate = underlying_price
-                .to_i64f64()
-                .checked_div(settlement_price.to_i64f64())
-                .ok_or(StateError::ArithmeticOverflow)?;
-            let position_value = FixedPoint::from_i64f64(cross_rate)
+            let cross_rate = observation
+                .conservative_underlying_settlement_price(settlement_price, position_endpoint)?;
+            let position_value = cross_rate
                 .checked_mul_int(position_value)
                 .map_err(|_| StateError::ArithmeticOverflow)?
                 .floor_atoms()

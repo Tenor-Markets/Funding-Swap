@@ -21,7 +21,7 @@ fn tick_index(tick: i16) -> usize {
 /// Restores a signed tick from its shared bitmap and directory position.
 /// Reverse of the above.
 fn tick_from_index(index: usize) -> i16 {
-    i16::from_ne_bytes(((index as u16) ^ 0x8000).to_ne_bytes())
+    i16::from_ne_bytes(((u16::try_from(index).expect("bounded book index")) ^ 0x8000).to_ne_bytes())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,13 +277,16 @@ impl HierarchicalBitmap {
             return None;
         }
 
-        let upper_word = self.top.trailing_zeros() as usize;
+        let upper_word =
+            usize::try_from(self.top.trailing_zeros()).expect("bitmap bit index fits usize");
         let level_one = self.level_one[upper_word];
 
-        let word = upper_word * 64 + level_one.trailing_zeros() as usize;
+        let word = upper_word * 64
+            + usize::try_from(level_one.trailing_zeros()).expect("bitmap bit index fits usize");
         let level_zero = self.level_zero[word];
 
-        let mapped = word * 64 + level_zero.trailing_zeros() as usize;
+        let mapped = word * 64
+            + usize::try_from(level_zero.trailing_zeros()).expect("bitmap bit index fits usize");
 
         Some(tick_from_index(mapped))
     }
@@ -294,13 +297,19 @@ impl HierarchicalBitmap {
             return None;
         }
 
-        let upper_word = 63 - self.top.leading_zeros() as usize;
+        let upper_word =
+            63 - usize::try_from(self.top.leading_zeros()).expect("bitmap bit index fits usize");
         let level_one = self.level_one[upper_word];
 
-        let word = upper_word * 64 + (63 - level_one.leading_zeros() as usize);
+        let word = upper_word * 64
+            + (63
+                - usize::try_from(level_one.leading_zeros()).expect("bitmap bit index fits usize"));
         let level_zero = self.level_zero[word];
 
-        let mapped = word * 64 + (63 - level_zero.leading_zeros() as usize);
+        let mapped = word * 64
+            + (63
+                - usize::try_from(level_zero.leading_zeros())
+                    .expect("bitmap bit index fits usize"));
 
         Some(tick_from_index(mapped))
     }
@@ -319,7 +328,8 @@ impl OrderBook {
             || tick_step > MAX_TICK_STEP
             || minimum_order_size_atoms == 0
             || minimum_order_size_atoms > maximum_order_size_atoms
-            || maximum_order_size_atoms > i64::MAX as u64
+            || maximum_order_size_atoms
+                > u64::try_from(i64::MAX).expect("nonnegative signed maximum")
             || maximum_open_orders_per_subaccount == 0
             || usize::from(maximum_open_orders_per_subaccount) > MAX_ORDERS
         {
@@ -339,7 +349,7 @@ impl OrderBook {
                 head: FREE_INDEX,
                 tail: FREE_INDEX,
                 next_free: if index + 1 < BOOK_CAPACITY {
-                    (index + 1) as u16
+                    u16::try_from(index + 1).map_err(|_| StateError::ArithmeticOverflow)?
                 } else {
                     FREE_INDEX
                 },
@@ -349,7 +359,7 @@ impl OrderBook {
             self.nodes[index] = OrderNode {
                 previous_node: FREE_INDEX,
                 next_node: if index + 1 < BOOK_CAPACITY {
-                    (index + 1) as u16
+                    u16::try_from(index + 1).map_err(|_| StateError::ArithmeticOverflow)?
                 } else {
                     FREE_INDEX
                 },
@@ -399,7 +409,7 @@ impl OrderBook {
             ..TickMetadata::zeroed()
         };
 
-        self.free_tick_metadata_head = index as u16;
+        self.free_tick_metadata_head = u16::try_from(index).expect("bounded book index");
     }
 
     /// Returns the active metadata for a side and tick, if the level exists.
@@ -423,7 +433,8 @@ impl OrderBook {
             ..TickMetadata::zeroed()
         };
 
-        self.directory_mut(side)[tick_index(tick)] = index as u16;
+        self.directory_mut(side)[tick_index(tick)] =
+            u16::try_from(index).expect("bounded book index");
     }
 
     /// Allocates a node and appends it to its side/tick FIFO.
@@ -456,7 +467,7 @@ impl OrderBook {
 
         let order_id = OrderId {
             sequence,
-            slab_index: index as u64,
+            slab_index: u64::try_from(index).map_err(|_| StateError::ArithmeticOverflow)?,
         };
 
         self.free_node_head = next_free;
@@ -478,10 +489,17 @@ impl OrderBook {
         if let Some(metadata_index) = metadata_index {
             let tail = self.tick_metadata[metadata_index].tail;
             self.nodes[index].previous_node = tail;
-            self.nodes[usize::from(tail)].next_node = index as u16;
-            self.tick_metadata[metadata_index].tail = index as u16;
+            self.nodes[usize::from(tail)].next_node =
+                u16::try_from(index).expect("bounded book index");
+            self.tick_metadata[metadata_index].tail =
+                u16::try_from(index).expect("bounded book index");
         } else {
-            self.add_metadata(side, tick, index as u16, index as u16);
+            self.add_metadata(
+                side,
+                tick,
+                u16::try_from(index).expect("bounded book index"),
+                u16::try_from(index).expect("bounded book index"),
+            );
             self.bitmap_mut(side).set(tick);
         }
 
@@ -528,7 +546,9 @@ impl OrderBook {
             .get_metadata(side, tick)
             .ok_or(StateError::InvalidReference)?;
 
-        if self.tick_metadata[metadata_index].tail == index as u16 {
+        if self.tick_metadata[metadata_index].tail
+            == u16::try_from(index).expect("bounded book index")
+        {
             return Ok(());
         }
 
@@ -546,8 +566,9 @@ impl OrderBook {
 
         self.nodes[index].previous_node = previous_tail;
         self.nodes[index].next_node = FREE_INDEX;
-        self.nodes[usize::from(previous_tail)].next_node = index as u16;
-        self.tick_metadata[metadata_index].tail = index as u16;
+        self.nodes[usize::from(previous_tail)].next_node =
+            u16::try_from(index).expect("bounded book index");
+        self.tick_metadata[metadata_index].tail = u16::try_from(index).expect("bounded book index");
 
         Ok(())
     }
@@ -608,7 +629,7 @@ impl OrderBook {
             ..OrderNode::zeroed()
         };
 
-        self.free_node_head = index as u16;
+        self.free_node_head = u16::try_from(index).expect("bounded book index");
     }
 
     /// Returns the FIFO head at the best price, or None when the side is empty.

@@ -266,11 +266,7 @@ fn pow10(decimals: u8) -> Result<u128, MathError> {
     if decimals > MAX_DECIMALS {
         return Err(MathError::Overflow);
     }
-    let mut value = 1u128;
-    for _ in 0..decimals {
-        value = value.checked_mul(10).ok_or(MathError::Overflow)?;
-    }
-    Ok(value)
+    crate::pow10(u32::from(decimals)).ok_or(MathError::Overflow)
 }
 
 fn gcd(mut a: u128, mut b: u128) -> u128 {

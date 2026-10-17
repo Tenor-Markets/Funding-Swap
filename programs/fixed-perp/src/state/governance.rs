@@ -36,11 +36,20 @@ pub enum GovernanceCategory {
 
 impl GovernanceCategory {
     pub const fn as_u8(self) -> u8 {
-        self as u8
+        match self {
+            Self::RiskTightening => 0,
+            Self::RiskRecovery => 1,
+            Self::FeesAndLiquidation => 2,
+            Self::Emergency => 3,
+            Self::Deleveraging => 4,
+            Self::Resources => 5,
+            Self::Treasury => 6,
+            Self::AuthorityAdministration => 7,
+        }
     }
 
-    pub const fn index(self) -> usize {
-        self.as_u8() as usize
+    pub fn index(self) -> usize {
+        usize::from(self.as_u8())
     }
 }
 

@@ -171,14 +171,14 @@ fn cleanup_with_transient_assets<'info>(
         for index in 0..count {
             let guard = guards[index].as_mut().ok_or(StateError::InvalidReference)?;
 
-            let pointer = (&mut **guard) as *mut MarketState;
+            let pointer = std::ptr::from_mut(&mut **guard);
             // SAFETY: each pointer is derived from a live, unique RefMut held
             // in `guards` until the borrowed slice is no longer used.
             refs[index].write(unsafe { &mut *pointer });
         }
 
         let market_slice = unsafe {
-            std::slice::from_raw_parts_mut(refs.as_mut_ptr() as *mut &mut MarketState, count)
+            std::slice::from_raw_parts_mut(refs.as_mut_ptr().cast::<&mut MarketState>(), count)
         };
 
         MarginGroup::close_only_cleanup(subaccount, market_slice)?;

@@ -135,11 +135,7 @@ fn pow10(decimals: u8) -> Option<u128> {
     if decimals > 18 {
         return None;
     }
-    let mut value = 1u128;
-    for _ in 0..decimals {
-        value = value.checked_mul(10)?;
-    }
-    Some(value)
+    crate::pow10(u32::from(decimals))
 }
 
 fn gcd_u128(mut a: u128, mut b: u128) -> u128 {

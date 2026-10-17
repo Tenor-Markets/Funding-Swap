@@ -326,10 +326,10 @@ pub fn normalize_source_delta(
     // economics by converting only those lot units.
     let mut native = native_delta.unsigned_abs();
     let mut q64_scale = 1u128 << 64;
-    let mut base_scale = 10u128
-        .checked_pow(u32::from(base_lot_decimals))
+    let mut base_scale = fixed_perp_math::pow10(u32::from(base_lot_decimals))
         .ok_or(AdapterError::NormalizationOverflow)?;
-    let mut denominator = 10u128.pow(u32::from(PHOENIX_QUOTE_LOT_DECIMALS));
+    let mut denominator = fixed_perp_math::pow10(u32::from(PHOENIX_QUOTE_LOT_DECIMALS))
+        .ok_or(AdapterError::NormalizationOverflow)?;
     for numerator in [&mut native, &mut q64_scale, &mut base_scale] {
         let divisor = gcd(*numerator, denominator);
         *numerator /= divisor;
