@@ -32,10 +32,10 @@ pub struct CreateAsset<'info> {
     )]
     pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
     #[account(
-        init, 
-        payer = authority, 
-        space = AssetState::SPACE, 
-        seeds = [b"asset_state", args.asset_id.to_le_bytes().as_ref()], 
+        init,
+        payer = authority,
+        space = AssetState::SPACE,
+        seeds = [b"asset_state", args.asset_id.to_le_bytes().as_ref()],
         bump
     )]
     pub asset: AccountLoader<'info, AssetState>,
@@ -47,7 +47,7 @@ pub fn handle_create_asset(context: Context<CreateAsset>, args: CreateAssetArgs)
     let token_account = match &context.accounts.token_account {
         Some(token) => {
             if token.owner != context.accounts.asset.key() {
-                return Err(error!(StateError::InvalidTokenAccount));
+                return Err(error!(StateError::InvalidTokenAuthority));
             }
 
             token.key()

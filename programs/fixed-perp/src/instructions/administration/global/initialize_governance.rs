@@ -31,7 +31,7 @@ pub struct InitializeGovernance<'info> {
     pub authority: Signer<'info>,
     #[account(
         address = crate::ID,
-        constraint = is_program_data(&program, &program_data) @ StateError::InvalidKey
+        constraint = is_program_data(&program, &program_data) @ StateError::InvalidAccountKey
     )]
     pub program: Program<'info>,
     #[account(

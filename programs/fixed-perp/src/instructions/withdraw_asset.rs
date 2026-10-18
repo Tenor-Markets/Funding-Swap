@@ -23,13 +23,13 @@ pub struct WithdrawAsset<'info> {
     #[account(
         mut,
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidKey
+        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidAccountKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
     #[account(
         mut,
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = asset.load()?.is_valid_custody(token_account.key()) @ StateError::InvalidReference
+        constraint = asset.load()?.is_valid_custody(token_account.key()) @ StateError::InvalidTargetCustody
     )]
     pub asset: AccountLoader<'info, AssetState>,
     pub mint: Account<'info, Mint>,
@@ -59,10 +59,7 @@ fn settle_markets_from_observations<'info>(
 
         let entry = market_observation_for(observations, market_id)?;
 
-        let mut market = entry
-            .loader
-            .load_mut()
-            .map_err(|_| StateError::InvalidReference)?;
+        let mut market = entry.loader.load_mut()?;
 
         materialize_market(subaccount, &mut market, slot_index)?;
 
@@ -108,20 +105,9 @@ fn validate_withdraw_health<'info>(
 
         let entry = market_observation_for(observations, slot.market_id)?;
 
-        market_guards[slot_index] = Some(
-            entry
-                .loader
-                .load()
-                .map_err(|_| error!(StateError::InvalidReference))?,
-        );
+        market_guards[slot_index] = Some(entry.loader.load()?);
 
-        underlying_guards[slot_index] = Some(
-            entry
-                .underlying
-                .loader
-                .load()
-                .map_err(|_| error!(StateError::InvalidReference))?,
-        );
+        underlying_guards[slot_index] = Some(entry.underlying.loader.load()?);
     }
 
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
@@ -133,11 +119,11 @@ fn validate_withdraw_health<'info>(
 
         let market = market_guards[slot_index]
             .as_ref()
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::MissingMarketObservation)?;
 
         let underlying_asset = underlying_guards[slot_index]
             .as_ref()
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::MissingUnderlyingObservation)?;
 
         portfolio[slot_index] = Some(PortfolioMarketObservation {
             market,

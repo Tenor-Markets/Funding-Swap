@@ -39,7 +39,7 @@ impl PriceModel {
     pub fn validate(self) -> StateResult<()> {
         match self.0 {
             PRICE_MODEL_FIXED | PRICE_MODEL_PEGGED | PRICE_MODEL_FLOATING => Ok(()),
-            _ => Err(StateError::InvalidTag),
+            _ => Err(StateError::InvalidPriceModel),
         }
     }
 
@@ -53,7 +53,7 @@ impl PriceModel {
 
     pub fn is_floating(&self) -> bool {
         self.0 == PRICE_MODEL_FLOATING
-    }        
+    }
 }
 
 /// Exact positive rational used when a matured market converts settlement
@@ -70,7 +70,7 @@ pub struct SettlementRatio {
 impl SettlementRatio {
     pub fn new(numerator: u128, denominator: u128) -> StateResult<Self> {
         if numerator == 0 || denominator == 0 {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidSettlementRatio);
         }
 
         let divisor = gcd(numerator, denominator);
@@ -150,7 +150,7 @@ impl SettlementRatio {
         settlement_decimals: u8,
     ) -> StateResult<Self> {
         if settlement_price == 0 || collateral_price == 0 {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidSettlementRatio);
         }
 
         // TODO: This seems to conflict with the comment above the function.
@@ -188,14 +188,14 @@ impl SettlementRatio {
         let collateral_raw = collateral_price.to_raw_bits();
 
         if settlement_raw <= 0 || collateral_raw <= 0 {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidSettlementRatio);
         }
 
         let mut numerator =
-            u128::try_from(settlement_raw).map_err(|_| StateError::InvalidConfiguration)?;
+            u128::try_from(settlement_raw).map_err(|_| StateError::InvalidSettlementRatio)?;
 
         let mut denominator =
-            u128::try_from(collateral_raw).map_err(|_| StateError::InvalidConfiguration)?;
+            u128::try_from(collateral_raw).map_err(|_| StateError::InvalidSettlementRatio)?;
 
         // The exponent from fixed prices are always 0, the price itself is 1.
         scale_signed_power(
@@ -212,22 +212,23 @@ impl SettlementRatio {
         Self::new(numerator, denominator)
     }
 
-    /// Builds the ratio from transient observations.  When both observations
+    /// Builds collateral atoms per settlement atom from transient observations.
+    /// When both observations
     /// came directly from Pyth, preserve their mantissa/exponent fields and
     /// avoid an intermediate Q64.64 division.  Fixed or on-peg observations
     /// intentionally fall back to their exact configured Q64.64 anchors.
-    pub fn from_observations(
-        settlement_price: FixedPoint,
+    pub fn from_settlement_and_collateral_observations(
+        effective_settlement_price: FixedPoint,
         settlement_observation: OracleObservation,
-        collateral_price: FixedPoint,
+        effective_collateral_price: FixedPoint,
         collateral_observation: OracleObservation,
         collateral_decimals: u8,
         settlement_decimals: u8,
     ) -> StateResult<Self> {
         if settlement_observation.price_mantissa > 0
             && collateral_observation.price_mantissa > 0
-            && settlement_price == settlement_observation.price
-            && collateral_price == collateral_observation.price
+            && effective_settlement_price == settlement_observation.normalized_price
+            && effective_collateral_price == collateral_observation.normalized_price
         {
             Self::from_price_mantissas(
                 u64::try_from(settlement_observation.price_mantissa)
@@ -241,8 +242,8 @@ impl SettlementRatio {
             )
         } else {
             Self::from_fixed_prices(
-                settlement_price,
-                collateral_price,
+                effective_settlement_price,
+                effective_collateral_price,
                 collateral_decimals,
                 settlement_decimals,
             )
@@ -294,15 +295,20 @@ fn ten_pow(exponent: u32) -> StateResult<u128> {
 /// The authenticated, transient observation used by health and settlement.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OracleObservation {
-    pub price: FixedPoint,
+    /// Central oracle price after applying the decimal exponent, in Q64.64.
+    pub normalized_price: FixedPoint,
+    /// Lower and upper confidence endpoints after decimal scaling, in Q64.64.
     pub lower: FixedPoint,
     pub upper: FixedPoint,
+    /// EMA after decimal scaling, in the same units as normalized_price.
     pub ema: FixedPoint,
     pub publish_time: i64,
+    /// Confidence width after decimal scaling, in Q64.64.
     pub confidence: FixedPoint,
     /// Original Pyth price fields, retained only in this transient value so
     /// finalization can form an exact ratio without first quantizing to Q64.64.
     pub price_mantissa: i128,
+    /// Decimal exponent belonging to the original price_mantissa.
     pub exponent: i32,
 }
 
@@ -324,15 +330,18 @@ impl OracleObservation {
         )
         .map_err(|_| StateError::InvalidClock)?;
 
-        if age > max_age_seconds
-            || self.price.to_raw_bits() <= 0
+        if age > max_age_seconds {
+            return Err(StateError::StaleObservation);
+        }
+
+        if self.normalized_price.to_raw_bits() <= 0
             || self.lower.to_raw_bits() <= 0
-            || self.upper.to_raw_bits() < self.price.to_raw_bits()
-            || self.lower.to_raw_bits() > self.price.to_raw_bits()
+            || self.upper.to_raw_bits() < self.normalized_price.to_raw_bits()
+            || self.lower.to_raw_bits() > self.normalized_price.to_raw_bits()
             || self.confidence.to_raw_bits() < 0
             || self.ema.to_raw_bits() <= 0
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOracleObservation);
         }
 
         let scale = 1u128 << 64;
@@ -340,8 +349,8 @@ impl OracleObservation {
         let confidence = u128::try_from(self.confidence.to_raw_bits())
             .map_err(|_| StateError::ArithmeticOverflow)?;
 
-        let price =
-            u128::try_from(self.price.to_raw_bits()).map_err(|_| StateError::ArithmeticOverflow)?;
+        let price = u128::try_from(self.normalized_price.to_raw_bits())
+            .map_err(|_| StateError::ArithmeticOverflow)?;
 
         let max_confidence = u128::try_from(max_confidence_ratio.to_raw_bits())
             .map_err(|_| StateError::ArithmeticOverflow)?;
@@ -355,11 +364,11 @@ impl OracleObservation {
             .ok_or(StateError::ArithmeticOverflow)?;
 
         if confidence_value > confidence_bound {
-            return Err(StateError::Conflict);
+            return Err(StateError::OracleConfidenceTooWide);
         }
 
         let delta = self
-            .price
+            .normalized_price
             .to_raw_bits()
             .checked_sub(self.ema.to_raw_bits())
             .ok_or(StateError::ArithmeticOverflow)?
@@ -380,7 +389,7 @@ impl OracleObservation {
             .ok_or(StateError::ArithmeticOverflow)?;
 
         if ema_value > ema_bound {
-            return Err(StateError::Conflict);
+            return Err(StateError::OracleEmaDeviationExceeded);
         }
 
         Ok(())
@@ -406,7 +415,7 @@ impl OracleObservation {
             return Ok(asset.reference_price);
         }
 
-        if asset.central_price_is_on_peg(self.price)? {
+        if asset.central_price_is_on_peg(self.normalized_price)? {
             Ok(asset.reference_price)
         } else {
             Ok(self.conservative_price(endpoint))
@@ -426,48 +435,48 @@ impl OracleObservation {
         use pyth_solana_receiver_sdk::{price_update::PriceUpdateV2, ID as PYTH_RECEIVER_ID};
 
         if account.owner != &PYTH_RECEIVER_ID {
-            return Err(StateError::InvalidReference);
+            return Err(StateError::InvalidAccountOwner);
         }
 
         let data = account
             .try_borrow_data()
-            .map_err(|_| StateError::InvalidReference)?;
+            .map_err(|_| StateError::AccountDataBorrowFailed)?;
 
         let mut bytes: &[u8] = &data;
 
-        let update =
-            PriceUpdateV2::try_deserialize(&mut bytes).map_err(|_| StateError::InvalidReference)?;
+        let update = PriceUpdateV2::try_deserialize(&mut bytes)
+            .map_err(|_| StateError::InvalidOracleAccountData)?;
 
         if update.verification_level
             != pyth_solana_receiver_sdk::price_update::VerificationLevel::Full
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::OracleNotFullyVerified);
         }
 
         let message = update.price_message;
 
         asset.validate_feed(message.feed_id)?;
 
-        let price = scale_pyth_value(i128::from(message.price), message.exponent)?;
+        let normalized_price = scale_pyth_value(i128::from(message.price), message.exponent)?;
         let confidence = scale_pyth_value(i128::from(message.conf), message.exponent)?;
         let ema = scale_pyth_value(i128::from(message.ema_price), message.exponent)?;
 
         let lower = FixedPoint::from_raw_bits(
-            price
+            normalized_price
                 .to_raw_bits()
                 .checked_sub(confidence.to_raw_bits())
                 .ok_or(StateError::ArithmeticOverflow)?,
         );
 
         let upper = FixedPoint::from_raw_bits(
-            price
+            normalized_price
                 .to_raw_bits()
                 .checked_add(confidence.to_raw_bits())
                 .ok_or(StateError::ArithmeticOverflow)?,
         );
 
         let observation = Self {
-            price,
+            normalized_price,
             lower,
             upper,
             ema,
@@ -491,7 +500,7 @@ impl OracleObservation {
         let one = asset.reference_price;
 
         Ok(Self {
-            price: one,
+            normalized_price: one,
             lower: one,
             upper: one,
             ema: one,
@@ -508,19 +517,19 @@ impl OracleObservation {
     pub fn effective_price(asset: &AssetState, observation: Self) -> FixedPoint {
         if asset.price_model.0 == PRICE_MODEL_FIXED
             || asset
-                .central_price_is_on_peg(observation.price)
+                .central_price_is_on_peg(observation.normalized_price)
                 .unwrap_or(false)
         {
             asset.reference_price
         } else {
-            observation.price
+            observation.normalized_price
         }
     }
 }
 
 fn scale_pyth_value(mantissa: i128, exponent: i32) -> StateResult<FixedPoint> {
     if mantissa < 0 {
-        return Err(StateError::InvalidConfiguration);
+        return Err(StateError::InvalidOraclePrice);
     }
 
     let value =
@@ -563,7 +572,7 @@ impl ValuationFactors {
             || self.discount_factor.to_raw_bits() > one
             || self.liability_factor.to_raw_bits() < one
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidValuationFactors);
         }
         Ok(())
     }

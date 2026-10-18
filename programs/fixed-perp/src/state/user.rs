@@ -135,30 +135,32 @@ impl Subaccount {
         group_id: u16,
     ) -> StateResult<()> {
         if authority == Pubkey::default() || subaccount_id == 0 || group_id == 0 {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidSubaccountIdentity);
         }
 
-        self.authority = authority;
-        self.subaccount_id = subaccount_id;
-        self.group_id = group_id;
-        self.status = super::SubaccountStatus(SUBACCOUNT_ACTIVE);
-        self.bump = bump;
-        self._pad_0 = [0; 10];
-        self.collateral_balance_atoms = 0;
-        self.delegate = Pubkey::default();
-        self.markets = [MarketSlot::zeroed(); MAX_MARKETS];
-        self.order_refs = [OrderRef::zeroed(); MAX_ORDERS];
-        self.order_ref_count = 0;
-        self._pad_1 = [0; 7];
-        self.reserved = [0; SUBACCOUNT_RESERVED];
-        self._pad_2 = [0; 8];
+        *self = Self {
+            authority,
+            subaccount_id,
+            group_id,
+            status: super::SubaccountStatus(SUBACCOUNT_ACTIVE),
+            bump,
+            _pad_0: [0; 10],
+            collateral_balance_atoms: 0,
+            delegate: Pubkey::default(),
+            markets: [MarketSlot::zeroed(); MAX_MARKETS],
+            order_refs: [OrderRef::zeroed(); MAX_ORDERS],
+            order_ref_count: 0,
+            _pad_1: [0; 7],
+            reserved: [0; SUBACCOUNT_RESERVED],
+            _pad_2: [0; 8],
+        };
         Ok(())
     }
 
     /// Changes the delegate; the default key deliberately clears delegation.
     pub fn set_delegate(&mut self, delegate: Pubkey) -> StateResult<()> {
         if delegate == self.authority {
-            return Err(StateError::InvalidAuthority);
+            return Err(StateError::DelegateIsOwner);
         }
 
         self.delegate = delegate;
@@ -186,7 +188,7 @@ impl Subaccount {
             .markets
             .iter()
             .position(|market_slot| market_slot.market_id == 0)
-            .ok_or(StateError::CapacityExhausted)?;
+            .ok_or(StateError::MarketSlotLimitExceeded)?;
 
         market.add_subaccount()?;
 
@@ -210,7 +212,7 @@ impl Subaccount {
         let market_slot = self
             .markets
             .get(market_slot_index)
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::InvalidMarketSlot)?;
 
         if market_slot.market_id != 0 {
             market.remove_subaccount()?;
@@ -231,10 +233,10 @@ impl Subaccount {
         let slot = self
             .markets
             .get(market_slot_index)
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::InvalidMarketSlot)?;
 
         if slot.market_id != market.config.market_id || market.subaccount_count == 0 {
-            return Err(StateError::InvalidMarket);
+            return Err(StateError::MarketSlotMismatch);
         }
 
         if slot.settlement_balance_atoms == 0 {
@@ -266,17 +268,17 @@ impl Subaccount {
     ) -> StateResult<()> {
         // TODO: Remove the two checks below, the callers handle this.
         if !market.is_matured() {
-            return Err(StateError::InvalidStatus);
+            return Err(StateError::MarketNotMatured);
         }
 
         let ratio = market
             .frozen_settlement_ratio()
-            .ok_or(StateError::InvalidStatus)?;
+            .ok_or(StateError::MissingSettlementRatio)?;
 
         let slot = self
             .markets
             .get(market_slot_index)
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::InvalidMarketSlot)?;
 
         if !slot.order_risk.is_empty()
             || self
@@ -284,7 +286,7 @@ impl Subaccount {
                 .iter()
                 .any(|reference| usize::from(reference.slot_index) == market_slot_index)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::OutstandingMarketOrders);
         }
 
         // The position is already in materialized open interest. Retiring it
@@ -295,7 +297,7 @@ impl Subaccount {
         let next_open_interest = market
             .materialized_gross_open_interest
             .checked_sub(position_abs)
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::OpenInterestAccountingMismatch)?;
 
         // Settlement is idempotent once the balance is zero, so a later close
         // failure can be retried without subtracting open interest twice.
@@ -358,7 +360,7 @@ impl OrderRiskAggregate {
         let floor_raw = rate_floor.to_raw_bits();
 
         if floor_raw < 0 {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::NegativeRateFloor);
         }
 
         let effective_raw = rate_raw.max(floor_raw);
@@ -456,13 +458,15 @@ impl OrderRiskAggregate {
             )
         };
 
-        let next_size = current_size.checked_sub(size).ok_or(StateError::Conflict)?;
+        let next_size = current_size
+            .checked_sub(size)
+            .ok_or(StateError::OrderRiskAccountingMismatch)?;
 
         // TODO: Why can't pm be negative?
         let next_pm = current_pm
             .checked_sub(contribution)
             .filter(|value| *value >= 0)
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::OrderRiskAccountingMismatch)?;
 
         if side == Side::Long {
             self.sum_long_order_size = next_size;

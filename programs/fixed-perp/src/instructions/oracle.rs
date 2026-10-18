@@ -41,16 +41,13 @@ pub(crate) fn read_asset_observation<'info>(
         .split_first()
         .ok_or_else(|| error!(StateError::InvalidRemainingAccounts))?;
 
-    let loader = AccountLoader::<AssetState>::try_from(asset_info)
-        .map_err(|_| error!(StateError::InvalidAssetState))?;
+    let loader = AccountLoader::<AssetState>::try_from(asset_info)?;
 
     let observation = {
-        let asset = loader
-            .load()
-            .map_err(|_| error!(StateError::InvalidAssetState))?;
+        let asset = loader.load()?;
 
         if asset_info.key() != expected_key {
-            return Err(error!(StateError::InvalidAssetState));
+            return Err(error!(StateError::InvalidAccountKey));
         }
 
         if !asset.is_active() {
@@ -114,14 +111,16 @@ pub(crate) fn settlement_ratio_with_guards(
     let collateral_price =
         OracleObservation::effective_price(collateral_guard, collateral.observation);
 
-    Ok(SettlementRatio::from_observations(
-        settlement_price,
-        settlement.observation,
-        collateral_price,
-        collateral.observation,
-        collateral_guard.decimals,
-        settlement_guard.decimals,
-    )?)
+    Ok(
+        SettlementRatio::from_settlement_and_collateral_observations(
+            settlement_price,
+            settlement.observation,
+            collateral_price,
+            collateral.observation,
+            collateral_guard.decimals,
+            settlement_guard.decimals,
+        )?,
+    )
 }
 
 /// Returns the configured underlying value in settlement units. Jupiter's
@@ -160,7 +159,7 @@ pub(crate) fn market_observation_for<'set, 'info, const N: usize>(
         .iter()
         .flatten()
         .find(|entry| entry.market_id == market_id)
-        .ok_or_else(|| error!(StateError::InvalidMarket))
+        .ok_or_else(|| error!(StateError::MissingMarketObservation))
 }
 
 /// Reads the observation prefix in one pass. The first two assets are the
@@ -196,9 +195,7 @@ pub(crate) fn read_observation_set<'info, const N: usize>(
         remaining = &remaining[1..];
 
         let (market_id, underlying_key) = {
-            let market = loader
-                .load()
-                .map_err(|_| error!(StateError::InvalidMarket))?;
+            let market = loader.load()?;
 
             (market.config.market_id, market.config.underlying_state)
         };

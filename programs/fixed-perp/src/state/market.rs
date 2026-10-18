@@ -70,19 +70,19 @@ impl PortfolioMarketObservation<'_> {
     /// conversion still applies its conservative price separately.
     fn conservative_underlying_settlement_price(
         &self,
-        settlement_price: FixedPoint,
+        conservative_settlement_price: FixedPoint,
         endpoint: PriceEndpoint,
     ) -> StateResult<FixedPoint> {
         if self.market.config.underlying_state == self.market.config.settlement_state {
             return Ok(FixedPoint::from_i64f64(I64F64::ONE));
         }
 
-        let underlying_price = self
+        let conservative_underlying_price = self
             .underlying
             .conservative_price_for(self.underlying_asset, endpoint)?;
-        let cross_rate = underlying_price
+        let cross_rate = conservative_underlying_price
             .to_i64f64()
-            .checked_div(settlement_price.to_i64f64())
+            .checked_div(conservative_settlement_price.to_i64f64())
             .ok_or(StateError::ArithmeticOverflow)?;
 
         Ok(FixedPoint::from_i64f64(cross_rate))
@@ -137,6 +137,36 @@ pub const VENUE_CONFIG_RESERVED: usize = 16;
 pub const VENUE_ADAPTER_PAYLOAD_WORDS: usize = core::mem::size_of::<PhoenixAdapterPayload>() / 16;
 pub const MARKET_CONFIG_RESERVED: usize = 32;
 pub const MARKET_STATE_RESERVED: usize = 24;
+// u128 alignment is 16 on the host and 8 on Solana. These fields name the
+// existing gaps without changing either target's persisted layout.
+pub const MARKET_U128_PADDING: usize = core::mem::align_of::<u128>() - 8;
+
+/// Explicit host alignment bytes; this field occupies zero bytes on Solana.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+pub struct MarketAlignmentPadding {
+    pub bytes: [u8; MARKET_U128_PADDING],
+}
+
+// IDLs describe the on-chain layout, not the host's extra alignment bytes.
+#[cfg(feature = "idl-build")]
+impl anchor_lang::idl::build::IdlBuild for MarketAlignmentPadding {
+    fn create_type() -> Option<anchor_lang::idl::types::IdlTypeDef> {
+        use anchor_lang::idl::types::{
+            IdlArrayLen, IdlSerialization, IdlType, IdlTypeDef, IdlTypeDefTy,
+        };
+        Some(IdlTypeDef {
+            name: Self::get_full_path(),
+            docs: vec!["Zero bytes in the Solana account layout.".into()],
+            serialization: IdlSerialization::Bytemuck,
+            repr: None,
+            generics: vec![],
+            ty: IdlTypeDefTy::Type {
+                alias: IdlType::Array(Box::new(IdlType::U8), IdlArrayLen::Value(0)),
+            },
+        })
+    }
+}
 
 pub const ADAPTER_JUPITER: u8 = 1;
 pub const ADAPTER_PHOENIX: u8 = 2;
@@ -209,7 +239,7 @@ impl MarginGroup {
         self.subaccount_count = self
             .subaccount_count
             .checked_sub(1)
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::SubaccountCountUnderflow)?;
 
         Ok(())
     }
@@ -329,7 +359,7 @@ pub struct MarketConfig {
     pub _pad_3: [u8; 12],
 }
 
-#[account(zero_copy(unsafe))]
+#[account(zero_copy)]
 #[repr(C)]
 #[derive(Debug, Eq, PartialEq)]
 pub struct MarketState {
@@ -345,6 +375,7 @@ pub struct MarketState {
     pub previous_mark_rate: FixedPoint,
     pub target_mark_rate: FixedPoint,
     pub last_eligible_trade_timestamp: i64,
+    pub _pad_open_interest: MarketAlignmentPadding,
     pub materialized_gross_open_interest: u128,
     pub pending_maker_oi_reserve: u128,
     pub accrued_protocol_fee_atoms: u128,
@@ -353,6 +384,7 @@ pub struct MarketState {
     pub source_seeded: u8,
     pub _pad_0: [u8; 2],
     pub subaccount_count: u32,
+    pub _pad_settlement_ratio: MarketAlignmentPadding,
     /// Authenticated collateral-per-settlement ratio frozen at maturity.
     pub frozen_settlement_ratio: SettlementRatio,
     /// Timestamp at which the settlement ratio was frozen.
@@ -378,13 +410,20 @@ impl MarketState {
         ratio: SettlementRatio,
         finalized_at: i64,
     ) -> StateResult<()> {
-        if ratio.numerator == 0
-            || ratio.denominator == 0
-            || !matches!(self.status.0, MARKET_ACTIVE | MARKET_CLOSE_ONLY)
-            || self.source_seeded != 1
-            || finalized_at < self.config.maturity_timestamp
-        {
+        if ratio.numerator == 0 || ratio.denominator == 0 {
+            return Err(StateError::InvalidSettlementRatio);
+        }
+
+        if !matches!(self.status.0, MARKET_ACTIVE | MARKET_CLOSE_ONLY) {
             return Err(StateError::InvalidStatus);
+        }
+
+        if self.source_seeded != 1 {
+            return Err(StateError::MarketSourceNotSeeded);
+        }
+
+        if finalized_at < self.config.maturity_timestamp {
+            return Err(StateError::MaturityNotReached);
         }
 
         self.frozen_settlement_ratio = ratio;
@@ -409,7 +448,7 @@ impl MarketState {
         self.subaccount_count = self
             .subaccount_count
             .checked_sub(1)
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::SubaccountCountUnderflow)?;
 
         Ok(())
     }
@@ -453,12 +492,15 @@ impl MarketState {
     /// matured market converts the fee at the same frozen ratio, floored.
     /// The same asset is already denominated in collateral atoms.
     pub fn accrued_fee_collateral_atoms(&self) -> StateResult<u128> {
-        if !self.is_matured() || self.subaccount_count != 0 {
-            return Err(StateError::InvalidStatus);
+        if !self.is_matured() {
+            return Err(StateError::MarketNotMatured);
+        }
+        if self.subaccount_count != 0 {
+            return Err(StateError::SubaccountsNotEmpty);
         }
 
         if self.materialized_gross_open_interest != 0 || self.pending_maker_oi_reserve != 0 {
-            return Err(StateError::Conflict);
+            return Err(StateError::UnsettledOpenInterest);
         }
 
         let fees = self.accrued_protocol_fee_atoms;
@@ -475,7 +517,7 @@ impl MarketState {
 
         let collateral = self
             .frozen_settlement_ratio()
-            .ok_or(StateError::InvalidStatus)?
+            .ok_or(StateError::MissingSettlementRatio)?
             .apply(fees)?;
 
         u128::try_from(collateral).map_err(|_| StateError::ArithmeticOverflow)
@@ -495,7 +537,7 @@ impl MarketState {
                 .checked_add(market.accrued_fee_collateral_atoms()?)
                 .ok_or(StateError::ArithmeticOverflow)?;
 
-            market.accrued_protocol_fee_atoms = 0;        
+            market.accrued_protocol_fee_atoms = 0;
         }
 
         let amount = u64::try_from(total).map_err(|_| StateError::ArithmeticOverflow)?;
@@ -527,7 +569,7 @@ impl MarketState {
         let ratio = health_ratio.to_i64f64();
 
         if ratio < I64F64::ZERO || ratio >= I64F64::ONE {
-            return Err(StateError::InvalidStatus);
+            return Err(StateError::InvalidLiquidationHealthRatio);
         }
         let time_to_maturity = self
             .config
@@ -535,19 +577,19 @@ impl MarketState {
             .checked_sub(now)
             .ok_or(StateError::InvalidClock)?;
         if time_to_maturity <= 0 {
-            return Err(StateError::InvalidStatus);
+            return Err(StateError::MarketExpired);
         }
 
         let victim_slot = victim
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
         let old_victim = victim.markets[victim_slot].position_size;
         if size_to_liquidator == 0
             || old_victim == 0
             || size_to_liquidator.signum() != old_victim.signum()
             || size_to_liquidator.unsigned_abs() > old_victim.unsigned_abs()
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::InvalidLiquidationSize);
         }
         let new_victim = old_victim
             .checked_sub(size_to_liquidator)
@@ -595,7 +637,7 @@ impl MarketState {
             .ok_or(StateError::ArithmeticOverflow)?;
         let factor = if k < ratio { k } else { ratio };
         if factor < I64F64::ZERO {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidMarketFactors);
         }
         let incentive = FixedPoint::from_i64f64(factor)
             .checked_mul_int(margin_drop)
@@ -635,7 +677,7 @@ impl MarketState {
             .and_then(|value| value.checked_add(u128::from(new_victim.unsigned_abs())))
             .and_then(|value| value.checked_sub(u128::from(old_liquidator.unsigned_abs())))
             .and_then(|value| value.checked_add(u128::from(new_liquidator.unsigned_abs())))
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::OpenInterestAccountingMismatch)?;
         let next_fees = self
             .accrued_protocol_fee_atoms
             .checked_add(fee)
@@ -651,7 +693,7 @@ impl MarketState {
                 .ok_or(StateError::ArithmeticOverflow)?,
             None => {
                 if !liquidator.markets.iter().any(|slot| slot.market_id == 0) {
-                    return Err(StateError::CapacityExhausted);
+                    return Err(StateError::MarketSlotLimitExceeded);
                 }
                 self.subaccount_count
                     .checked_add(1)
@@ -701,19 +743,19 @@ impl MarketState {
             .checked_sub(now)
             .ok_or(StateError::InvalidClock)?;
         if time_to_maturity <= 0 {
-            return Err(StateError::InvalidStatus);
+            return Err(StateError::MarketExpired);
         }
         let alpha_bits = alpha.to_raw_bits();
         if alpha_bits < 0 || alpha_bits > (1i128 << 64) {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidDeleveragingFraction);
         }
 
         let winner_slot = winner
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
         let loser_slot = loser
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
         let old_winner = winner.markets[winner_slot].position_size;
         let old_loser = loser.markets[loser_slot].position_size;
         let loser_trade = size_to_winner
@@ -722,7 +764,7 @@ impl MarketState {
         if !Self::trade_reduces(old_winner, size_to_winner)
             || !Self::trade_reduces(old_loser, loser_trade)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::DeleveragingMustReduceBothPositions);
         }
         let new_winner = old_winner
             .checked_add(size_to_winner)
@@ -763,7 +805,7 @@ impl MarketState {
             .and_then(|value| value.checked_add(u128::from(new_winner.unsigned_abs())))
             .and_then(|value| value.checked_sub(u128::from(old_loser.unsigned_abs())))
             .and_then(|value| value.checked_add(u128::from(new_loser.unsigned_abs())))
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::OpenInterestAccountingMismatch)?;
 
         // The loser's book is cancelled only after the transfer is known to fit.
         self.close_all_orders(loser, loser_slot)?;
@@ -824,7 +866,7 @@ impl MarketState {
             .and_then(|value| value.checked_div(year))
             .ok_or(StateError::ArithmeticOverflow)?;
         fixed_perp_math::rate::FeeRate::try_from_i64f64(maturity_scaled_rate)
-            .map_err(|_| StateError::InvalidConfiguration)?
+            .map_err(|_| StateError::InvalidFeeRate)?
             .settlement_fee_atoms_scaled(
                 u128::from(size),
                 self.config.underlying_decimals,
@@ -921,8 +963,12 @@ impl MarketState {
 
     /// Converts a book tick into its Q64.64 rate.
     fn rate_at_tick(&self, tick: i16) -> StateResult<Rate> {
-        Rate::from_tick(tick, self.order_book.tick_step)
-            .map_err(|_| StateError::InvalidConfiguration)
+        Rate::from_tick(tick, self.order_book.tick_step).map_err(|error| match error {
+            fixed_perp_math::error::MathError::InvalidTickStep => StateError::InvalidTickStep,
+            fixed_perp_math::error::MathError::Overflow => StateError::ArithmeticOverflow,
+            fixed_perp_math::error::MathError::NegativeFee => StateError::InvalidFeeRate,
+            fixed_perp_math::error::MathError::InvalidDuration => StateError::InvalidMarketTiming,
+        })
     }
 
     /// Checks a rate against one symmetric mark-relative distance factor.
@@ -959,7 +1005,7 @@ impl MarketState {
         let rate = self.rate_at_tick(tick)?.to_fixed_point();
 
         if !self.rate_within_bound(rate, current, self.config.trade_mark_update_bound_factor)? {
-            return Err(StateError::Conflict);
+            return Err(StateError::TradeRateOutsideMarkBound);
         }
 
         self.previous_mark_rate = current;
@@ -1005,23 +1051,23 @@ impl MarketState {
         if taker.markets[taker_market_slot].close_only_exempt == 0
             && !Self::fill_is_closing(taker.markets[taker_market_slot].position_size, taker_fill)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::CloseOnlyViolation);
         }
 
         let maker_index = close_only_makers
             .binary_search_by_key(&maker_subaccount, |maker| maker.key)
-            .map_err(|_| StateError::NotFound)?;
+            .map_err(|_| StateError::MissingMakerSubaccount)?;
 
         let maker = close_only_makers[maker_index].subaccount;
 
         let slot_index = maker
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         if maker.markets[slot_index].close_only_exempt == 0
             && !Self::fill_is_closing(self.projected_position(maker, slot_index)?, maker_fill)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::CloseOnlyViolation);
         }
 
         Ok(())
@@ -1039,7 +1085,7 @@ impl MarketState {
             && (size < self.config.minimum_position_size_atoms
                 || size > self.config.maximum_position_size_atoms)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::PositionSizeOutOfBounds);
         }
 
         Ok(())
@@ -1053,46 +1099,46 @@ impl VenueAdapterConfig {
     /// Views a Jupiter payload after confirming the active adapter tag.
     pub fn jupiter(&self) -> StateResult<&JupiterAdapterPayload> {
         if self.kind.0 != ADAPTER_JUPITER {
-            return Err(StateError::InvalidTag);
+            return Err(StateError::AdapterKindMismatch);
         }
 
         bytemuck::try_from_bytes(
             &bytemuck::bytes_of(&self.payload)[..core::mem::size_of::<JupiterAdapterPayload>()],
         )
-        .map_err(|_| StateError::InvalidConfiguration)
+        .map_err(|_| StateError::InvalidAdapterPayload)
     }
 
     /// Mutably views a Jupiter payload after confirming the active adapter tag.
     pub fn jupiter_mut(&mut self) -> StateResult<&mut JupiterAdapterPayload> {
         if self.kind.0 != ADAPTER_JUPITER {
-            return Err(StateError::InvalidTag);
+            return Err(StateError::AdapterKindMismatch);
         }
 
         bytemuck::try_from_bytes_mut(
             &mut bytemuck::bytes_of_mut(&mut self.payload)
                 [..core::mem::size_of::<JupiterAdapterPayload>()],
         )
-        .map_err(|_| StateError::InvalidConfiguration)
+        .map_err(|_| StateError::InvalidAdapterPayload)
     }
 
     /// Views a Phoenix payload after confirming the active adapter tag.
     pub fn phoenix(&self) -> StateResult<&PhoenixAdapterPayload> {
         if self.kind.0 != ADAPTER_PHOENIX {
-            return Err(StateError::InvalidTag);
+            return Err(StateError::AdapterKindMismatch);
         }
 
         bytemuck::try_from_bytes(bytemuck::bytes_of(&self.payload))
-            .map_err(|_| StateError::InvalidConfiguration)
+            .map_err(|_| StateError::InvalidAdapterPayload)
     }
 
     /// Mutably views a Phoenix payload after confirming the active adapter tag.
     pub fn phoenix_mut(&mut self) -> StateResult<&mut PhoenixAdapterPayload> {
         if self.kind.0 != ADAPTER_PHOENIX {
-            return Err(StateError::InvalidTag);
+            return Err(StateError::AdapterKindMismatch);
         }
 
         bytemuck::try_from_bytes_mut(bytemuck::bytes_of_mut(&mut self.payload))
-            .map_err(|_| StateError::InvalidConfiguration)
+            .map_err(|_| StateError::InvalidAdapterPayload)
     }
 
     /// Clears opaque bytes before storing a validated tagged adapter configuration.
@@ -1115,7 +1161,7 @@ impl VenueAdapterConfig {
                 payload._pad_0 = [0; 10];
                 payload.reserved = [0; PHOENIX_PAYLOAD_RESERVED];
             }
-            _ => return Err(StateError::InvalidTag),
+            _ => return Err(StateError::InvalidAdapterKind),
         }
 
         Ok(())
@@ -1131,7 +1177,7 @@ impl VenueAdapterConfig {
                     || payload.pool == Pubkey::default()
                     || payload.mint == Pubkey::default()
                 {
-                    return Err(StateError::InvalidConfiguration);
+                    return Err(StateError::InvalidJupiterConfiguration);
                 }
             }
             ADAPTER_PHOENIX => {
@@ -1148,10 +1194,10 @@ impl VenueAdapterConfig {
                     || payload.max_funding_age_seconds == 0
                     || payload.max_mark_age_slots == 0
                 {
-                    return Err(StateError::InvalidConfiguration);
+                    return Err(StateError::InvalidPhoenixConfiguration);
                 }
             }
-            _ => return Err(StateError::InvalidTag),
+            _ => return Err(StateError::InvalidAdapterKind),
         }
 
         Ok(())
@@ -1190,33 +1236,40 @@ impl MarketConfig {
         underlying_decimals: u8,
         settlement_decimals: u8,
     ) -> StateResult<()> {
-        self.hard_gross_open_interest_cap_atoms = hard_gross_open_interest_cap_atoms;
-        self.start_timestamp = start_timestamp;
-        self.maturity_timestamp = maturity_timestamp;
-        self.minimum_position_size_atoms = minimum_position_size_atoms;
-        self.maximum_position_size_atoms = maximum_position_size_atoms;
-        self.collateral_state = collateral_state;
-        self.settlement_state = settlement_state;
-        self.underlying_state = underlying_state;
-        self.adapter = adapter;
-        self.rate_floor = rate_floor;
-        self.initial_margin_factor = initial_margin_factor;
-        self.maintenance_margin_factor = maintenance_margin_factor;
-        self.order_rate_bound_factor = order_rate_bound_factor;
-        self.closing_margin_relief_bound_factor = closing_margin_relief_bound_factor;
-        self.trade_mark_update_bound_factor = trade_mark_update_bound_factor;
-        self.taker_fee_rate = taker_fee_rate;
-        self.annualized_settlement_fee_rate = annualized_settlement_fee_rate;
-        self.liquidation_base_incentive = liquidation_base_incentive;
-        self.liquidation_incentive_slope = liquidation_incentive_slope;
-        self.liquidation_fee_rate = liquidation_fee_rate;
-        self.market_id = market_id;
-        self.mark_observation_window_seconds = mark_observation_window_seconds;
-        self.margin_time_threshold_seconds = margin_time_threshold_seconds;
-        self.tick_scale = tick_scale;
-        self.underlying_decimals = underlying_decimals;
-        self.settlement_decimals = settlement_decimals;
-        self.pm_cache_nonce = 0;
+        *self = Self {
+            hard_gross_open_interest_cap_atoms,
+            start_timestamp,
+            maturity_timestamp,
+            minimum_position_size_atoms,
+            maximum_position_size_atoms,
+            collateral_state,
+            settlement_state,
+            underlying_state,
+            adapter,
+            rate_floor,
+            initial_margin_factor,
+            maintenance_margin_factor,
+            order_rate_bound_factor,
+            closing_margin_relief_bound_factor,
+            trade_mark_update_bound_factor,
+            taker_fee_rate,
+            annualized_settlement_fee_rate,
+            liquidation_base_incentive,
+            liquidation_incentive_slope,
+            liquidation_fee_rate,
+            market_id,
+            mark_observation_window_seconds,
+            margin_time_threshold_seconds,
+            tick_scale,
+            underlying_decimals,
+            settlement_decimals,
+            pm_cache_nonce: 0,
+            _pad_0: [0; 16],
+            _pad_units: 0,
+            reserved: [0; MARKET_CONFIG_RESERVED],
+            _pad_2: [0; 12],
+            _pad_3: [0; 12],
+        };
         self.zero_opaque_bytes()?;
         self.validate()
     }
@@ -1237,17 +1290,25 @@ impl MarketConfig {
             || self.underlying_decimals > fixed_perp_math::rate::MAX_DECIMALS
             || self.settlement_decimals > fixed_perp_math::rate::MAX_DECIMALS
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidAssetDecimals);
         }
 
-        if self.market_id == 0
-            || self.start_timestamp < 0
+        if self.start_timestamp < 0
             || self.maturity_timestamp <= 0
             || self.start_timestamp >= self.maturity_timestamp
-            || self.collateral_state == Pubkey::default()
+        {
+            return Err(StateError::InvalidMarketTiming);
+        }
+        if self.market_id == 0 {
+            return Err(StateError::InvalidMarket);
+        }
+        if self.collateral_state == Pubkey::default()
             || self.settlement_state == Pubkey::default()
             || self.underlying_state == Pubkey::default()
-            || self.hard_gross_open_interest_cap_atoms == 0
+        {
+            return Err(StateError::InvalidAccountKey);
+        }
+        if self.hard_gross_open_interest_cap_atoms == 0
             || self.minimum_position_size_atoms == 0
             || self.maximum_position_size_atoms == 0
             || self.mark_observation_window_seconds == 0
@@ -1256,7 +1317,7 @@ impl MarketConfig {
             || u128::from(self.maximum_position_size_atoms)
                 > self.hard_gross_open_interest_cap_atoms
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidMarketLimits);
         }
 
         let nonnegative = [
@@ -1277,7 +1338,7 @@ impl MarketConfig {
             || self.initial_margin_factor.to_raw_bits()
                 < self.maintenance_margin_factor.to_raw_bits()
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidMarketFactors);
         }
 
         self.adapter.validate()
@@ -1299,7 +1360,7 @@ impl MarketConfig {
             || self.underlying_decimals != underlying_decimals
             || self.settlement_decimals != settlement_decimals
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidAssetDecimals);
         }
 
         Ok(())
@@ -1335,33 +1396,67 @@ impl MarketState {
             maximum_open_orders_per_subaccount,
         )?;
 
-        self.config = config;
-        self.floating_index = FixedPoint::zeroed();
-        self.fee_index = FixedPoint::zeroed();
-        self.source_native_checkpoint = 0;
         let one = FixedPoint::from_raw_bits(1i128 << 64);
-        self.position_factors = ValuationFactors {
+        // A whole-market assignment creates a large SBF stack temporary.
+        // Exhaustive destructuring retains field coverage while writing in place.
+        let Self {
+            config: stored_config,
+            floating_index: stored_floating_index,
+            fee_index: stored_fee_index,
+            source_native_checkpoint: stored_source_native_checkpoint,
+            position_factors: stored_position_factors,
+            source_last_update_timestamp: stored_source_last_update_timestamp,
+            protocol_checkpoint_timestamp: stored_protocol_checkpoint_timestamp,
+            epoch_origin_timestamp: stored_epoch_origin_timestamp,
+            checkpoint_epoch: stored_checkpoint_epoch,
+            previous_mark_rate: stored_previous_mark_rate,
+            target_mark_rate: stored_target_mark_rate,
+            last_eligible_trade_timestamp: stored_last_eligible_trade_timestamp,
+            materialized_gross_open_interest: stored_materialized_gross_open_interest,
+            pending_maker_oi_reserve: stored_pending_maker_oi_reserve,
+            accrued_protocol_fee_atoms: stored_accrued_protocol_fee_atoms,
+            status: stored_status,
+            source_seeded: stored_source_seeded,
+            _pad_0: stored_pad_0,
+            subaccount_count: stored_subaccount_count,
+            frozen_settlement_ratio: stored_frozen_settlement_ratio,
+            finalized_at_timestamp: stored_finalized_at_timestamp,
+            reserved: stored_reserved,
+            order_book: _,
+            _pad_open_interest: stored_pad_open_interest,
+            _pad_settlement_ratio: stored_pad_settlement_ratio,
+        } = self;
+        *stored_config = config;
+        *stored_floating_index = FixedPoint::zeroed();
+        *stored_fee_index = FixedPoint::zeroed();
+        *stored_source_native_checkpoint = 0;
+        *stored_position_factors = ValuationFactors {
             discount_factor: one,
             liability_factor: one,
         };
-
-        self.source_last_update_timestamp = now;
-        self.protocol_checkpoint_timestamp = now;
-        self.epoch_origin_timestamp = now;
-        self.checkpoint_epoch = 0;
-        self.previous_mark_rate = FixedPoint::zeroed();
-        self.target_mark_rate = FixedPoint::zeroed();
-        self.last_eligible_trade_timestamp = now;
-        self.materialized_gross_open_interest = 0;
-        self.pending_maker_oi_reserve = 0;
-        self.accrued_protocol_fee_atoms = 0;
-        self.status = super::MarketStatus(MARKET_PENDING);
-        self.source_seeded = 0;
-        self._pad_0 = [0; 2];
-        self.subaccount_count = 0;
-        self.frozen_settlement_ratio = SettlementRatio::zeroed();
-        self.finalized_at_timestamp = 0;
-        self.reserved = [0; MARKET_STATE_RESERVED];
+        *stored_source_last_update_timestamp = now;
+        *stored_protocol_checkpoint_timestamp = now;
+        *stored_epoch_origin_timestamp = now;
+        *stored_checkpoint_epoch = 0;
+        *stored_previous_mark_rate = FixedPoint::zeroed();
+        *stored_target_mark_rate = FixedPoint::zeroed();
+        *stored_last_eligible_trade_timestamp = now;
+        *stored_materialized_gross_open_interest = 0;
+        *stored_pending_maker_oi_reserve = 0;
+        *stored_accrued_protocol_fee_atoms = 0;
+        *stored_status = super::MarketStatus(MARKET_PENDING);
+        *stored_source_seeded = 0;
+        *stored_pad_0 = [0; 2];
+        *stored_subaccount_count = 0;
+        *stored_frozen_settlement_ratio = SettlementRatio::zeroed();
+        *stored_finalized_at_timestamp = 0;
+        *stored_reserved = [0; MARKET_STATE_RESERVED];
+        *stored_pad_open_interest = MarketAlignmentPadding {
+            bytes: [0; MARKET_U128_PADDING],
+        };
+        *stored_pad_settlement_ratio = MarketAlignmentPadding {
+            bytes: [0; MARKET_U128_PADDING],
+        };
 
         Ok(())
     }
@@ -1438,7 +1533,7 @@ impl MarketState {
         }
 
         if price.to_raw_bits() <= 0 {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOraclePrice);
         }
 
         let fee_rate = fixed::types::I64F64::from_bits(
@@ -1564,9 +1659,9 @@ impl MarketState {
         self.order_book.validate_order_size(size)?;
 
         if expiry_timestamp != 0
-                && (expiry_timestamp <= now || expiry_timestamp > self.config.maturity_timestamp)
+            && (expiry_timestamp <= now || expiry_timestamp > self.config.maturity_timestamp)
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOrderExpiry);
         }
 
         if !self.rate_within_bound(
@@ -1574,7 +1669,7 @@ impl MarketState {
             current_mark,
             self.config.order_rate_bound_factor,
         )? {
-            return Err(StateError::Conflict);
+            return Err(StateError::OrderRateOutsideMarkBound);
         }
 
         Ok(())
@@ -1634,7 +1729,7 @@ impl MarketState {
             }
 
             if maker_subaccount == taker_key {
-                return Err(StateError::Conflict);
+                return Err(StateError::SelfTrade);
             }
 
             let candidate = remaining
@@ -1754,7 +1849,7 @@ impl MarketState {
             && self.order_crosses(side, order_intent.limit_tick)
         {
             if order_intent.time_in_force.rejects_crossing() {
-                return Err(StateError::Conflict);
+                return Err(StateError::PostOnlyOrderWouldCross);
             }
 
             if order_intent.time_in_force.skips_crossing() {
@@ -1802,7 +1897,7 @@ impl MarketState {
         }
 
         if order_intent.time_in_force.is_fill_or_kill() && result.remaining_size != 0 {
-            return Err(StateError::NotFound);
+            return Err(StateError::FillOrKillUnfilled);
         }
 
         if result.remaining_size != 0
@@ -1842,7 +1937,7 @@ impl MarketState {
             || intent.orders.len() > super::MAX_ORDERS
             || results.len() != intent.orders.len()
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOrderBatch);
         }
 
         let current_mark = self.current_mark_rate(now)?;
@@ -1876,7 +1971,7 @@ impl MarketState {
                 if self.order_crosses(intent.side, order.limit_tick)
                     && intent.time_in_force.rejects_crossing()
                 {
-                    return Err(StateError::Conflict);
+                    return Err(StateError::PostOnlyOrderWouldCross);
                 }
 
                 PlaceOrderResult {
@@ -1906,7 +2001,7 @@ impl MarketState {
         if intent.time_in_force.is_fill_or_kill()
             && results.iter().any(|result| result.remaining_size != 0)
         {
-            return Err(StateError::NotFound);
+            return Err(StateError::FillOrKillUnfilled);
         }
 
         for (order, result) in intent.orders.iter().zip(results.iter_mut()) {
@@ -1968,7 +2063,7 @@ impl MarketState {
             .find_order_ref_at_tick(subaccount, slot_index, order.tick)
             .is_some()
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::DuplicateOrderAtTick);
         }
 
         // TODO: Would it make more sense to store it on the struct?
@@ -1978,10 +2073,11 @@ impl MarketState {
             .filter(|reference| usize::from(reference.slot_index) == slot_index)
             .count();
 
-        if usize::from(subaccount.order_ref_count) >= super::MAX_ORDERS
-            || market_order_count >= usize::from(self.order_book.maximum_open_orders_per_subaccount)
-        {
-            return Err(StateError::CapacityExhausted);
+        if usize::from(subaccount.order_ref_count) >= super::MAX_ORDERS {
+            return Err(StateError::SubaccountOrderLimitExceeded);
+        }
+        if market_order_count >= usize::from(self.order_book.maximum_open_orders_per_subaccount) {
+            return Err(StateError::MarketOrderLimitExceeded);
         }
 
         let rate = self.rate_at_tick(order.tick)?.to_fixed_point();
@@ -2006,7 +2102,7 @@ impl MarketState {
                 Some(Side::from_size(order.size)?),
             ) || subaccount.markets[slot_index].close_only_exempt != 0)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::CloseOnlyViolation);
         }
 
         let order_id = self.order_book.add_order(
@@ -2146,10 +2242,10 @@ impl MarketState {
 
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         let Some(ref_index) = self.find_order_ref_by_id(subaccount, slot_index, order_id) else {
-            return Err(StateError::NotFound);
+            return Err(StateError::OrderNotFound);
         };
 
         let node_index = usize::from(subaccount.order_refs[ref_index].node_index);
@@ -2161,12 +2257,12 @@ impl MarketState {
         };
 
         if self.order_book.nodes[node_index].has_pending_fill() {
-            return Err(StateError::Conflict);
+            return Err(StateError::UnmaterializedOrderFill);
         }
 
         // We don't flip side from the modify path: https://pochettes.pulsradio.com/drake%20-%20hotline%20bling.jpg
         if new_size.signum() != remaining_size.signum() {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::OrderSideChangeNotAllowed);
         }
 
         let old_size = remaining_size.unsigned_abs();
@@ -2219,7 +2315,7 @@ impl MarketState {
                 Some(side),
             ) || subaccount.markets[slot_index].close_only_exempt != 0)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::CloseOnlyViolation);
         }
 
         self.order_book
@@ -2238,7 +2334,7 @@ impl MarketState {
         changes: &[ModifyOrderIntent],
     ) -> StateResult<()> {
         if changes.len() > super::MAX_ORDERS {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOrderBatch);
         }
 
         for change in changes {
@@ -2257,10 +2353,10 @@ impl MarketState {
     ) -> StateResult<()> {
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         let Some(ref_index) = self.find_order_ref_by_id(subaccount, slot_index, order_id) else {
-            return Err(StateError::NotFound);
+            return Err(StateError::OrderNotFound);
         };
 
         self.cancel_order_ref(subaccount, slot_index, ref_index)
@@ -2274,7 +2370,7 @@ impl MarketState {
         orders: &[OrderId],
     ) -> StateResult<()> {
         if orders.len() > super::MAX_ORDERS {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOrderBatch);
         }
 
         for order_id in orders {
@@ -2298,7 +2394,7 @@ impl MarketState {
         slot_index: usize,
     ) -> StateResult<()> {
         if slot_index >= subaccount.markets.len() {
-            return Err(StateError::InvalidReference);
+            return Err(StateError::InvalidMarketSlot);
         }
 
         let ref_index = usize::from(subaccount.order_ref_count);
@@ -2327,12 +2423,12 @@ impl MarketState {
         maximum_tick: i16,
     ) -> StateResult<()> {
         if minimum_tick > maximum_tick {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidTickRange);
         }
 
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         let ref_index = usize::from(subaccount.order_ref_count);
 
@@ -2362,7 +2458,7 @@ impl MarketState {
     pub fn close_wrong_side_orders(&mut self, subaccount: &mut Subaccount) -> StateResult<()> {
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         let position = self.projected_position(subaccount, slot_index)?;
 
@@ -2401,7 +2497,7 @@ impl MarketState {
     pub fn close_excess_opposite_orders(&mut self, subaccount: &mut Subaccount) -> StateResult<()> {
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         let position = self.projected_position(subaccount, slot_index)?;
 
@@ -2475,11 +2571,11 @@ impl MarketState {
                 let Some(ref_index) =
                     Self::find_ref_index_by_node(subaccount, slot_index, node_index)
                 else {
-                    return Err(StateError::InvalidReference);
+                    return Err(StateError::OrderNotFound);
                 };
 
                 self.cancel_order_ref(subaccount, slot_index, ref_index)?;
-            } else if kept + size <= needed { 
+            } else if kept + size <= needed {
                 kept += size;
             } else {
                 // The straddling order: trim it to exactly cover the position.
@@ -2775,7 +2871,7 @@ impl MarketState {
             .ok_or(StateError::ArithmeticOverflow)?;
 
         fixed_perp_math::rate::FeeRate::try_from_i64f64(maturity_scaled_rate)
-            .map_err(|_| StateError::InvalidConfiguration)?
+            .map_err(|_| StateError::InvalidFeeRate)?
             .settlement_fee_atoms_scaled(
                 u128::from(size),
                 self.config.underlying_decimals,
@@ -2874,14 +2970,14 @@ impl MarketState {
             .materialized_gross_open_interest
             .checked_sub(u128::from(slot.position_size.unsigned_abs()))
             .and_then(|value| value.checked_add(u128::from(next_position.unsigned_abs())))
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::OpenInterestAccountingMismatch)?;
 
         let capped = next_materialized
             .checked_add(next_reserve)
             .ok_or(StateError::ArithmeticOverflow)?;
 
         if capped > self.config.hard_gross_open_interest_cap_atoms {
-            return Err(StateError::Conflict);
+            return Err(StateError::OpenInterestCapExceeded);
         }
 
         let next_accrued_fee = self
@@ -2920,7 +3016,7 @@ impl MarketState {
             .ok_or(StateError::ArithmeticOverflow)?;
 
         if capped > self.config.hard_gross_open_interest_cap_atoms {
-            return Err(StateError::Conflict);
+            return Err(StateError::OpenInterestCapExceeded);
         }
 
         Ok(capped)
@@ -2941,7 +3037,7 @@ impl MarketState {
             && (new_position_abs < u128::from(self.config.minimum_position_size_atoms)
                 || new_position_abs > u128::from(self.config.maximum_position_size_atoms))
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::PositionSizeOutOfBounds);
         }
 
         // Pending fills reserve their full absolute size. Materialization
@@ -2950,20 +3046,20 @@ impl MarketState {
 
         // Exact replacement must not turn a bounded reservation into extra OI.
         if exact_delta > reserved_amount {
-            return Err(StateError::Conflict);
+            return Err(StateError::InsufficientOpenInterestReserve);
         }
 
         let after_old = self
             .materialized_gross_open_interest
             .checked_sub(old_position_abs)
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::OpenInterestAccountingMismatch)?;
         let next_materialized = after_old
             .checked_add(new_position_abs)
             .ok_or(StateError::ArithmeticOverflow)?;
         let next_reserve = self
             .pending_maker_oi_reserve
             .checked_sub(reserved_amount)
-            .ok_or(StateError::Conflict)?;
+            .ok_or(StateError::InsufficientOpenInterestReserve)?;
         let next_capped = next_materialized
             .checked_add(next_reserve)
             .ok_or(StateError::ArithmeticOverflow)?;
@@ -2977,7 +3073,7 @@ impl MarketState {
         if next_capped > self.config.hard_gross_open_interest_cap_atoms
             && !(self.is_matured() && next_capped <= current_capped)
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::OpenInterestCapExceeded);
         }
 
         self.materialized_gross_open_interest = next_materialized;
@@ -3218,7 +3314,7 @@ impl MarketState {
             // `closing_margin_relief_bound_factor * max(abs(mark), rate_floor)`
             // of the mark, signed by the final position side.
             if new_resting_order_side.is_some() {
-                let worst = worst_closing_rate.ok_or(StateError::InvalidConfiguration)?;
+                let worst = worst_closing_rate.ok_or(StateError::MissingClosingOrderRate)?;
                 let base = mark
                     .to_i64f64()
                     .checked_abs()
@@ -3401,7 +3497,7 @@ impl PortfolioHealth {
     /// Checks initial-margin health and rejects a maintenance-margin aggregate.
     pub fn strict_im_met(&self) -> StateResult<bool> {
         let MarginRequirement::Initial(required_margin) = self.required_margin else {
-            return Err(StateError::Conflict);
+            return Err(StateError::ExpectedInitialMargin);
         };
 
         let available = self
@@ -3415,7 +3511,7 @@ impl PortfolioHealth {
     /// Checks critical health from a maintenance-margin aggregate.
     pub fn critical_health_met(&self, critical_health_ratio: FixedPoint) -> StateResult<bool> {
         let MarginRequirement::Maintenance(required_margin) = self.required_margin else {
-            return Err(StateError::Conflict);
+            return Err(StateError::ExpectedMaintenanceMargin);
         };
 
         let required = critical_health_ratio
@@ -3442,7 +3538,7 @@ impl PortfolioHealth {
         risky_order_cancellation_ratio: FixedPoint,
     ) -> StateResult<bool> {
         let MarginRequirement::Maintenance(required_margin) = self.required_margin else {
-            return Err(StateError::Conflict);
+            return Err(StateError::ExpectedMaintenanceMargin);
         };
 
         let threshold = risky_order_cancellation_ratio
@@ -3463,11 +3559,11 @@ impl PortfolioHealth {
     /// Negative value is bad debt and is not liquidatable here.
     pub fn liquidation_health_ratio(&self) -> StateResult<FixedPoint> {
         let MarginRequirement::Maintenance(maintenance) = self.required_margin else {
-            return Err(StateError::Conflict);
+            return Err(StateError::ExpectedMaintenanceMargin);
         };
 
         if maintenance <= 0 {
-            return Err(StateError::InvalidStatus);
+            return Err(StateError::NoMaintenanceMargin);
         }
 
         let available = self
@@ -3475,8 +3571,11 @@ impl PortfolioHealth {
             .checked_add(self.total_value)
             .ok_or(StateError::ArithmeticOverflow)?;
 
-        if available < 0 || available >= maintenance {
-            return Err(StateError::InvalidStatus);
+        if available < 0 {
+            return Err(StateError::NegativeEquity);
+        }
+        if available >= maintenance {
+            return Err(StateError::NotLiquidatable);
         }
 
         self.maintenance_health_ratio()
@@ -3486,11 +3585,11 @@ impl PortfolioHealth {
     /// outside `[0, 1)`. Deleveraging compares these directly.
     pub fn maintenance_health_ratio(&self) -> StateResult<FixedPoint> {
         let MarginRequirement::Maintenance(maintenance) = self.required_margin else {
-            return Err(StateError::Conflict);
+            return Err(StateError::ExpectedMaintenanceMargin);
         };
 
         if maintenance <= 0 {
-            return Err(StateError::InvalidStatus);
+            return Err(StateError::NoMaintenanceMargin);
         }
 
         let available = self
@@ -3513,7 +3612,7 @@ impl MarginGroup {
         if self.collateral_state != market.config.collateral_state
             || self.settlement_state != market.config.settlement_state
         {
-            return Err(StateError::Conflict);
+            return Err(StateError::MarketAssetMismatch);
         }
 
         Ok(())
@@ -3522,7 +3621,7 @@ impl MarginGroup {
     /// Ensures the subaccount belongs to this group.
     pub fn ensure_subaccount_matches(&self, subaccount: &Subaccount) -> StateResult<()> {
         if self.group_id != subaccount.group_id {
-            return Err(StateError::Conflict);
+            return Err(StateError::InvalidGroupID);
         }
 
         Ok(())
@@ -3542,34 +3641,38 @@ impl MarginGroup {
         critical_health_ratio: FixedPoint,
         risky_order_cancellation_ratio: FixedPoint,
     ) -> StateResult<()> {
-        if group_id == 0
-            || collateral_state == Pubkey::default()
-            || settlement_state == Pubkey::default()
-            || critical_health_ratio.to_raw_bits() <= 0
+        if group_id == 0 {
+            return Err(StateError::InvalidGroupID);
+        }
+        if collateral_state == Pubkey::default() || settlement_state == Pubkey::default() {
+            return Err(StateError::InvalidAccountKey);
+        }
+        if critical_health_ratio.to_raw_bits() <= 0
             || risky_order_cancellation_ratio.to_raw_bits() < critical_health_ratio.to_raw_bits()
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidGroupHealthRatios);
         }
 
-        self.group_id = group_id;
-        self.bump = bump;
-        self.status = GROUP_PENDING;
-        self.collateral_state = collateral_state;
-        self.settlement_state = settlement_state;
-        self.critical_health_ratio = critical_health_ratio;
-        self.risky_order_cancellation_ratio = risky_order_cancellation_ratio;
-        self.market_count = 0;
-        self.subaccount_count = 0;
         let one = FixedPoint::from_raw_bits(1i128 << 64);
-
-        self.collateral_factors = ValuationFactors {
+        let factors = ValuationFactors {
             discount_factor: one,
             liability_factor: one,
         };
-
-        self.settlement_factors = self.collateral_factors;
-        self._pad_0 = [0; 4];
-        self.reserved = [0; MARGIN_GROUP_RESERVED];
+        *self = Self {
+            group_id,
+            bump,
+            status: GROUP_PENDING,
+            collateral_state,
+            settlement_state,
+            critical_health_ratio,
+            risky_order_cancellation_ratio,
+            market_count: 0,
+            subaccount_count: 0,
+            collateral_factors: factors,
+            settlement_factors: factors,
+            _pad_0: [0; 4],
+            reserved: [0; MARGIN_GROUP_RESERVED],
+        };
 
         Ok(())
     }
@@ -3672,7 +3775,8 @@ impl MarginGroup {
                 continue;
             }
 
-            let observation = markets_by_slot[slot_index].ok_or(StateError::NotFound)?;
+            let observation =
+                markets_by_slot[slot_index].ok_or(StateError::MissingMarketObservation)?;
             let market = observation.market;
 
             let time = market
@@ -3690,10 +3794,12 @@ impl MarginGroup {
             // then conservatively rounded at the settlement-atom boundary.
             let position_endpoint = PriceEndpoint::for_signed_value(position_value);
 
-            let settlement_price = settlement_observation
+            let conservative_settlement_price = settlement_observation
                 .conservative_price_for(settlement_asset, position_endpoint)?;
-            let cross_rate = observation
-                .conservative_underlying_settlement_price(settlement_price, position_endpoint)?;
+            let cross_rate = observation.conservative_underlying_settlement_price(
+                conservative_settlement_price,
+                position_endpoint,
+            )?;
             let position_value = cross_rate
                 .checked_mul_int(position_value)
                 .map_err(|_| StateError::ArithmeticOverflow)?
@@ -3704,7 +3810,7 @@ impl MarginGroup {
 
             total_value = total_value
                 .checked_add(
-                    settlement_price
+                    conservative_settlement_price
                         .scaled_value_atoms(position_value, settlement_asset.decimals)
                         .map_err(|_| StateError::ArithmeticOverflow)?,
                 )
@@ -3787,7 +3893,7 @@ impl MarginGroup {
                 .iter_mut()
                 .flatten()
                 .find(|market| market.config.market_id == market_id)
-                .ok_or(StateError::InvalidReference)?;
+                .ok_or(StateError::MissingMarketAccount)?;
 
             market.close_all_orders(subaccount, slot_index)?;
         }
@@ -3802,9 +3908,9 @@ impl MarginGroup {
     /// supplied market that holds references dispatches its own market-local
     /// sweep. No market or book scan repeats per market, and markets without
     /// references are never touched.
-    fn dispatch_cleanup(
+    fn dispatch_cleanup<'a>(
         subaccount: &mut Subaccount,
-        markets: &mut [&mut MarketState],
+        markets: impl IntoIterator<Item = &'a mut MarketState>,
     ) -> StateResult<()> {
         let mut slots_with_refs = [false; super::MAX_MARKETS];
 
@@ -3812,7 +3918,7 @@ impl MarginGroup {
             slots_with_refs[usize::from(reference.slot_index)] = true;
         }
 
-        for market in markets.iter_mut() {
+        for market in markets {
             let Some(slot_index) = subaccount.lookup_market(market.config.market_id) else {
                 continue;
             };
@@ -3835,9 +3941,9 @@ impl MarginGroup {
     /// remains closes the position without flipping. The caller owns
     /// activation; this helper performs no health or authority checks.
     /// Assumes the caller materialized every pending fill first.
-    pub fn close_only_cleanup(
+    pub fn close_only_cleanup<'a>(
         subaccount: &mut Subaccount,
-        markets: &mut [&mut MarketState],
+        markets: impl IntoIterator<Item = &'a mut MarketState>,
     ) -> StateResult<()> {
         Self::dispatch_cleanup(subaccount, markets)
     }

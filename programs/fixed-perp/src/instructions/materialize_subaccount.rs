@@ -46,16 +46,13 @@ pub fn handle_materialize_subaccount<'info>(
     let mut subaccount = context.accounts.subaccount.load_mut()?;
 
     for account_info in context.remaining_accounts {
-        let loader = AccountLoader::<MarketState>::try_from(account_info)
-            .map_err(|_| StateError::InvalidReference)?;
+        let loader = AccountLoader::<MarketState>::try_from(account_info)?;
 
-        let mut market = loader
-            .load_mut()
-            .map_err(|_| StateError::InvalidReference)?;
+        let mut market = loader.load_mut()?;
 
         let slot_index = subaccount
             .lookup_market(market.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         materialize_market(&mut subaccount, &mut market, slot_index)?;
     }

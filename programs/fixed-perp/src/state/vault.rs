@@ -26,8 +26,11 @@ fn valid_window_durations(durations: [u64; 3]) -> bool {
 
 impl WithdrawalWindow {
     fn check_and_update(&mut self, amount: u128, now: i64) -> StateResult<()> {
-        if now < 0 || self.duration_seconds == 0 {
+        if now < 0 {
             return Err(StateError::InvalidClock);
+        }
+        if self.duration_seconds == 0 {
+            return Err(StateError::InvalidWithdrawalWindowDurations);
         }
 
         let epoch =
@@ -107,14 +110,23 @@ impl AssetState {
         medium_window_limit_atoms: u128,
         long_window_limit_atoms: u128,
     ) -> StateResult<()> {
-        if asset_id == 0
-            || decimals > fixed_perp_math::rate::MAX_DECIMALS
-            || max_confidence_ratio.to_raw_bits() < 0
+        if asset_id == 0 {
+            return Err(StateError::InvalidAssetId);
+        }
+
+        if decimals > fixed_perp_math::rate::MAX_DECIMALS {
+            return Err(StateError::InvalidAssetDecimals);
+        }
+
+        if max_confidence_ratio.to_raw_bits() < 0
             || max_ema_deviation.to_raw_bits() < 0
             || max_peg_deviation.to_raw_bits() < 0
-            || !valid_window_durations(window_durations)
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOraclePolicy);
+        }
+
+        if !valid_window_durations(window_durations) {
+            return Err(StateError::InvalidWithdrawalWindowDurations);
         }
 
         price_model.validate()?;
@@ -129,7 +141,7 @@ impl AssetState {
                     || max_confidence_ratio.to_raw_bits() != 0
                     || max_ema_deviation.to_raw_bits() != 0
                 {
-                    return Err(StateError::InvalidConfiguration);
+                    return Err(StateError::InvalidFixedAssetConfiguration);
                 }
             }
             PRICE_MODEL_PEGGED => {
@@ -138,7 +150,7 @@ impl AssetState {
                     || max_age_seconds == 0
                     || max_peg_deviation.to_raw_bits() >= one.to_raw_bits()
                 {
-                    return Err(StateError::InvalidConfiguration);
+                    return Err(StateError::InvalidPeggedAssetConfiguration);
                 }
             }
             PRICE_MODEL_FLOATING => {
@@ -147,42 +159,47 @@ impl AssetState {
                     || max_age_seconds == 0
                     || max_peg_deviation.to_raw_bits() != 0
                 {
-                    return Err(StateError::InvalidConfiguration);
+                    return Err(StateError::InvalidFloatingAssetConfiguration);
                 }
             }
-            _ => return Err(StateError::InvalidTag),
+            _ => return Err(StateError::InvalidPriceModel),
         }
 
-        self.asset_id = asset_id;
-        self.bump = bump;
-        self.status = ASSET_PENDING;
-        self.price_model = price_model;
-        self.decimals = decimals;
-        self._pad_0 = [0; 8];
-        self.token_account = token_account;
-        self.feed_id = feed_id;
-        self._pad_1 = [0; 8];
-        self.reference_price = reference_price;
-        self.max_age_seconds = max_age_seconds;
-        self.max_confidence_ratio = max_confidence_ratio;
-        self.max_ema_deviation = max_ema_deviation;
-        self.max_peg_deviation = max_peg_deviation;
-        self.short_window = WithdrawalWindow {
-            limit_atoms: short_window_limit_atoms,
-            duration_seconds: window_durations[0],
-            ..WithdrawalWindow::default()
+        *self = Self {
+            asset_id,
+            bump,
+            status: ASSET_PENDING,
+            price_model,
+            decimals,
+            _pad_0: [0; 8],
+            token_account,
+            feed_id,
+            _pad_1: [0; 8],
+            reference_price,
+            max_age_seconds,
+            max_confidence_ratio,
+            max_ema_deviation,
+            max_peg_deviation,
+            short_window: WithdrawalWindow {
+                limit_atoms: short_window_limit_atoms,
+                duration_seconds: window_durations[0],
+                withdrawn_atoms: 0,
+                epoch: 0,
+            },
+            medium_window: WithdrawalWindow {
+                limit_atoms: medium_window_limit_atoms,
+                duration_seconds: window_durations[1],
+                withdrawn_atoms: 0,
+                epoch: 0,
+            },
+            long_window: WithdrawalWindow {
+                limit_atoms: long_window_limit_atoms,
+                duration_seconds: window_durations[2],
+                withdrawn_atoms: 0,
+                epoch: 0,
+            },
+            _pad_3: [0; 16],
         };
-        self.medium_window = WithdrawalWindow {
-            limit_atoms: medium_window_limit_atoms,
-            duration_seconds: window_durations[1],
-            ..WithdrawalWindow::default()
-        };
-        self.long_window = WithdrawalWindow {
-            limit_atoms: long_window_limit_atoms,
-            duration_seconds: window_durations[2],
-            ..WithdrawalWindow::default()
-        };
-        self._pad_3 = [0; 16];
 
         Ok(())
     }
@@ -211,7 +228,7 @@ impl AssetState {
         if self.price_model.0 != PRICE_MODEL_FIXED
             && (self.feed_id == [0; 32] || self.feed_id != feed_id)
         {
-            return Err(StateError::InvalidReference);
+            return Err(StateError::InvalidOracleFeed);
         }
 
         Ok(())
@@ -277,7 +294,7 @@ impl AssetState {
         if self.price_model.0 == PRICE_MODEL_FIXED {
             super::OracleObservation::fixed(self, now)
         } else {
-            let account = feed_account.ok_or(StateError::InvalidReference)?;
+            let account = feed_account.ok_or(StateError::MissingOraclePriceAccount)?;
             super::OracleObservation::from_pyth_account(account, self, now)
         }
     }

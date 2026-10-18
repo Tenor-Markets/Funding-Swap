@@ -15,7 +15,7 @@ pub struct CloseMarket<'info> {
     #[account(
         mut,
         close = rent_recipient,
-        constraint = is_zero(market.load()?.subaccount_count) @ StateError::Conflict
+        constraint = is_zero(market.load()?.subaccount_count) @ StateError::SubaccountsNotEmpty
     )]
     pub market: AccountLoader<'info, MarketState>,
     /// CHECK: Receives rent from the closed market.

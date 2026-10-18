@@ -21,9 +21,11 @@ pub fn handle_finalize_market<'info>(context: Context<'info, FinalizeMarket<'inf
 }
 
 fn ensure_finalization_ready(market: &MarketState, now: i64) -> Result<()> {
-    if now < market.config.maturity_timestamp
-        || !matches!(market.status.0, MARKET_ACTIVE | MARKET_CLOSE_ONLY)
-    {
+    if now < market.config.maturity_timestamp {
+        return Err(error!(StateError::MaturityNotReached));
+    }
+
+    if !matches!(market.status.0, MARKET_ACTIVE | MARKET_CLOSE_ONLY) {
         return Err(error!(StateError::InvalidStatus));
     }
 
@@ -74,15 +76,12 @@ pub fn handle_finalize_markets<'info>(context: Context<'info, FinalizeMarkets>) 
     let mut remaining = context.remaining_accounts;
 
     while let Some(market_info) = remaining.first() {
-        let loader = AccountLoader::<MarketState>::try_from(market_info)
-            .map_err(|_| error!(StateError::InvalidMarket))?;
+        let loader = AccountLoader::<MarketState>::try_from(market_info)?;
 
         remaining = &remaining[1..];
 
         let (collateral_key, settlement_key, underlying_key) = {
-            let market = loader
-                .load()
-                .map_err(|_| error!(StateError::InvalidMarket))?;
+            let market = loader.load()?;
 
             ensure_finalization_ready(&market, now)?;
 

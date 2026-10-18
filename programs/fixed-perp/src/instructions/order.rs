@@ -47,15 +47,14 @@ fn maker_accounts<'info>(
     usize,
 )> {
     if remaining.len() > MAX_ORDERS {
-        return Err(error!(StateError::CapacityExhausted));
+        return Err(error!(StateError::TooManyMakerAccounts));
     }
 
     let mut loaders: [Option<AccountLoader<'info, Subaccount>>; MAX_ORDERS] =
         core::array::from_fn(|_| None);
 
     for (index, info) in remaining.iter().enumerate() {
-        let loader = AccountLoader::<Subaccount>::try_from(info)
-            .map_err(|_| error!(StateError::InvalidAccountInfo))?;
+        let loader = AccountLoader::<Subaccount>::try_from(info)?;
 
         loaders[index] = Some(loader);
     }
@@ -70,17 +69,9 @@ fn check_initial_health<'info>(
     observations: &ObservationSet<'info>,
     now: i64,
 ) -> Result<()> {
-    let collateral_guard = observations
-        .collateral
-        .loader
-        .load()
-        .map_err(|_| error!(StateError::InvalidAssetState))?;
+    let collateral_guard = observations.collateral.loader.load()?;
 
-    let settlement_guard = observations
-        .settlement
-        .loader
-        .load()
-        .map_err(|_| error!(StateError::InvalidAssetState))?;
+    let settlement_guard = observations.settlement.loader.load()?;
 
     let mut market_guards: [Option<Ref<'_, MarketState>>; MAX_MARKETS] =
         core::array::from_fn(|_| None);
@@ -92,20 +83,9 @@ fn check_initial_health<'info>(
         if slot.market_id != 0 {
             let entry = market_observation_for(observations, slot.market_id)?;
 
-            market_guards[slot_index] = Some(
-                entry
-                    .loader
-                    .load()
-                    .map_err(|_| error!(StateError::InvalidMarket))?,
-            );
+            market_guards[slot_index] = Some(entry.loader.load()?);
 
-            underlying_guards[slot_index] = Some(
-                entry
-                    .underlying
-                    .loader
-                    .load()
-                    .map_err(|_| error!(StateError::InvalidAssetState))?,
-            );
+            underlying_guards[slot_index] = Some(entry.underlying.loader.load()?);
         }
     }
 
@@ -117,11 +97,11 @@ fn check_initial_health<'info>(
 
             let market = market_guards[slot_index]
                 .as_ref()
-                .ok_or(StateError::InvalidReference)?;
+                .ok_or(StateError::MissingMarketObservation)?;
 
             let underlying_asset = underlying_guards[slot_index]
                 .as_ref()
-                .ok_or(StateError::InvalidReference)?;
+                .ok_or(StateError::MissingUnderlyingObservation)?;
 
             portfolio[slot_index] = Some(PortfolioMarketObservation {
                 market,
@@ -167,10 +147,7 @@ fn materialize_other_markets<'info>(
             continue;
         }
 
-        let mut market = entry
-            .loader
-            .load_mut()
-            .map_err(|_| error!(StateError::InvalidMarket))?;
+        let mut market = entry.loader.load_mut()?;
 
         materialize_market(subaccount, &mut market, slot_index)?;
     }
@@ -238,9 +215,8 @@ fn execute_place_order<'info>(
         maker_guards[index] = Some(
             maker_loaders[index]
                 .as_ref()
-                .ok_or(StateError::InvalidReference)?
-                .load()
-                .map_err(|_| error!(StateError::InvalidAccountInfo))?,
+                .ok_or(StateError::MissingMakerSubaccount)?
+                .load()?,
         );
     }
 
@@ -263,7 +239,7 @@ fn execute_place_order<'info>(
             let first_key = maker_accounts[0].key();
             let first_account = maker_guards[0]
                 .as_ref()
-                .ok_or(StateError::InvalidReference)?;
+                .ok_or(StateError::MissingMakerSubaccount)?;
 
             let mut makers: [MakerSubaccount<'_>; MAX_ORDERS] =
                 core::array::from_fn(|_| MakerSubaccount {
@@ -274,7 +250,7 @@ fn execute_place_order<'info>(
             for index in 0..maker_count {
                 let guard = maker_guards[index]
                     .as_ref()
-                    .ok_or(StateError::InvalidReference)?;
+                    .ok_or(StateError::MissingMakerSubaccount)?;
 
                 makers[index] = MakerSubaccount {
                     key: maker_accounts[index].key(),
@@ -310,7 +286,7 @@ pub fn handle_cancel_order<'info>(
 
     let slot_index = subaccount
         .lookup_market(market.config.market_id)
-        .ok_or(StateError::NotFound)?;
+        .ok_or(StateError::MarketNotEntered)?;
 
     materialize_market(&mut subaccount, &mut market, slot_index)?;
 
@@ -365,7 +341,7 @@ fn execute_modify_order<'info>(
 
         let slot_index = subaccount
             .lookup_market(market.config.market_id)
-            .ok_or(StateError::NotFound)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         materialize_market(&mut subaccount, &mut market, slot_index)?;
 

@@ -26,7 +26,7 @@ pub struct CreateSubaccount<'info> {
         mut,
         constraint = global_governance
             .load()?
-            .is_creation_fee_destination(creation_fee_destination.key()) @ StateError::InvalidKey
+            .is_creation_fee_destination(creation_fee_destination.key()) @ StateError::InvalidCreationFeeDestination
     )]
     pub creation_fee_destination: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,

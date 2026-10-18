@@ -23,7 +23,7 @@ pub struct Deleverage<'info> {
     pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
     #[account(
         mut,
-        constraint = winner.key() != loser.key() @ StateError::Conflict,
+        constraint = winner.key() != loser.key() @ StateError::DuplicateSubaccount,
         constraint = winner.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID
     )]
     pub winner: AccountLoader<'info, Subaccount>,
@@ -106,7 +106,7 @@ fn execute_deleverage<'info>(
         // The paper requires the winner to be strictly healthier. Boros checks
         // that outside the market, and this instruction is that caller.
         if winner_ratio.to_raw_bits() <= loser_ratio.to_raw_bits() {
-            return Err(StateError::Conflict.into());
+            return Err(StateError::WinnerNotHealthier.into());
         }
     }
 
@@ -118,10 +118,7 @@ fn execute_deleverage<'info>(
     let loss = {
         let mut winner = accounts.winner.load_mut()?;
         let mut loser = accounts.loser.load_mut()?;
-        let mut market = entry
-            .loader
-            .load_mut()
-            .map_err(|_| StateError::InvalidMarket)?;
+        let mut market = entry.loader.load_mut()?;
         market.deleverage(
             &mut winner,
             &mut loser,
@@ -162,7 +159,7 @@ fn portfolio_settlement_value<'info, const N: usize>(
             .ok_or_else(|| error!(StateError::ArithmeticOverflow))?;
         let entry = market_observation_for(observations, slot.market_id)?;
         let position_value = {
-            let market = entry.loader.load().map_err(|_| StateError::InvalidMarket)?;
+            let market = entry.loader.load()?;
             let time_to_maturity = market
                 .config
                 .maturity_timestamp
@@ -173,7 +170,7 @@ fn portfolio_settlement_value<'info, const N: usize>(
             }
             let mark = market.current_mark_rate(now)?;
             if market.config.settlement_state != observations.settlement.loader.key() {
-                return Err(error!(StateError::Conflict));
+                return Err(error!(StateError::MarketAssetMismatch));
             }
             market.position_value(slot.position_size, mark, time_to_maturity)?
         };

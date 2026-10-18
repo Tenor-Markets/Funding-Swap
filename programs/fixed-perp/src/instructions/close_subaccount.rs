@@ -19,7 +19,7 @@ pub struct CloseSubaccount<'info> {
     #[account(
         mut,
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidKey
+        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidAccountKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
     #[account(
@@ -28,13 +28,13 @@ pub struct CloseSubaccount<'info> {
     pub asset: AccountLoader<'info, AssetState>,
     pub mint: Account<'info, Mint>,
     #[account(
-        mut, 
-        token::mint = mint, 
+        mut,
+        token::mint = mint,
         token::authority = asset
     )]
     pub token_account: Account<'info, TokenAccount>,
     #[account(
-        mut, 
+        mut,
         token::mint = mint
     )]
     pub destination: Account<'info, TokenAccount>,
@@ -55,10 +55,9 @@ fn market_account_for_slot<'info>(
     let market_id = subaccount.markets[slot_index].market_id;
 
     for account_info in remaining_accounts {
-        let loader = AccountLoader::<MarketState>::try_from(account_info)
-            .map_err(|_| StateError::InvalidAccountInfo)?;
+        let loader = AccountLoader::<MarketState>::try_from(account_info)?;
 
-        let market = loader.load().map_err(|_| StateError::InvalidMarket)?;
+        let market = loader.load()?;
 
         if market.config.market_id == market_id {
             return Ok(account_info);
@@ -85,10 +84,9 @@ fn close_subaccount_markets_from_accounts<'info>(
 
         let market_info = market_account_for_slot(subaccount, slot_index, remaining_accounts)?;
 
-        let loader = AccountLoader::<MarketState>::try_from(market_info)
-            .map_err(|_| StateError::InvalidAccountInfo)?;
+        let loader = AccountLoader::<MarketState>::try_from(market_info)?;
 
-        let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+        let mut market = loader.load_mut()?;
 
         materialize_market(subaccount, &mut market, slot_index)?;
 

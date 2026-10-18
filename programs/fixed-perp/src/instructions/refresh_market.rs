@@ -134,9 +134,7 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
 
             let custody_info = &context.remaining_accounts[source_offset];
 
-            let custody_data = custody_info
-                .try_borrow_data()
-                .map_err(|_| StateError::InvalidAccountInfo)?;
+            let custody_data = custody_info.try_borrow_data()?;
 
             let account = JupiterAccount {
                 account: source_view(custody_info, &custody_data),
@@ -194,16 +192,12 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
             let asset_map_info = &context.remaining_accounts[source_offset + 1];
 
             if global_info.key() == asset_map_info.key() {
-                return Err(StateError::InvalidAccountInfo.into());
+                return Err(StateError::DuplicateSourceAccount.into());
             }
 
-            let global_data = global_info
-                .try_borrow_data()
-                .map_err(|_| StateError::InvalidAccountInfo)?;
+            let global_data = global_info.try_borrow_data()?;
 
-            let asset_map_data = asset_map_info
-                .try_borrow_data()
-                .map_err(|_| StateError::InvalidAccountInfo)?;
+            let asset_map_data = asset_map_info.try_borrow_data()?;
 
             let observation = phoenix::observe(
                 &source_config,
@@ -226,7 +220,7 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
                 true,
             )
         }
-        _ => return Err(StateError::InvalidTag.into()),
+        _ => return Err(StateError::InvalidAdapterKind.into()),
     };
 
     drop(market);
@@ -293,9 +287,7 @@ pub fn handle_seed_market_source<'info>(
 
             let custody_info = &context.remaining_accounts[0];
 
-            let custody_data = custody_info
-                .try_borrow_data()
-                .map_err(|_| StateError::InvalidAccountInfo)?;
+            let custody_data = custody_info.try_borrow_data()?;
 
             let account = JupiterAccount {
                 account: source_view(custody_info, &custody_data),
@@ -337,16 +329,12 @@ pub fn handle_seed_market_source<'info>(
             let asset_map_info = &context.remaining_accounts[1];
 
             if global_info.key() == asset_map_info.key() {
-                return Err(StateError::InvalidAccountInfo.into());
+                return Err(StateError::DuplicateSourceAccount.into());
             }
 
-            let global_data = global_info
-                .try_borrow_data()
-                .map_err(|_| StateError::InvalidAccountInfo)?;
+            let global_data = global_info.try_borrow_data()?;
 
-            let asset_map_data = asset_map_info
-                .try_borrow_data()
-                .map_err(|_| StateError::InvalidAccountInfo)?;
+            let asset_map_data = asset_map_info.try_borrow_data()?;
 
             let source = phoenix::validate_source(
                 &source_config,
@@ -364,7 +352,7 @@ pub fn handle_seed_market_source<'info>(
                     .map_err(|_| StateError::InvalidClock)?,
             )
         }
-        _ => return Err(StateError::InvalidTag.into()),
+        _ => return Err(StateError::InvalidAdapterKind.into()),
     };
 
     drop(market);

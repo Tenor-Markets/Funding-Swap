@@ -48,10 +48,7 @@ pub fn handle_risky_order_cleanup<'info>(
                 continue;
             };
 
-            let mut market = entry
-                .loader
-                .load_mut()
-                .map_err(|_| StateError::InvalidMarket)?;
+            let mut market = entry.loader.load_mut()?;
 
             materialize_market(&mut subaccount, &mut market, slot_index)?;
         }
@@ -70,17 +67,9 @@ fn cleanup_with_transient_assets<'info>(
     now: i64,
 ) -> Result<()> {
     let cleanup_eligible = {
-        let collateral_guard = observations
-            .collateral
-            .loader
-            .load()
-            .map_err(|_| StateError::InvalidAssetState)?;
+        let collateral_guard = observations.collateral.loader.load()?;
 
-        let settlement_guard = observations
-            .settlement
-            .loader
-            .load()
-            .map_err(|_| StateError::InvalidAssetState)?;
+        let settlement_guard = observations.settlement.loader.load()?;
 
         let mut market_guards: [Option<std::cell::Ref<'_, MarketState>>; MAX_MARKETS] =
             core::array::from_fn(|_| None);
@@ -92,16 +81,9 @@ fn cleanup_with_transient_assets<'info>(
             if slot.market_id != 0 {
                 let entry = market_observation_for(observations, slot.market_id)?;
 
-                market_guards[slot_index] =
-                    Some(entry.loader.load().map_err(|_| StateError::InvalidMarket)?);
+                market_guards[slot_index] = Some(entry.loader.load()?);
 
-                underlying_guards[slot_index] = Some(
-                    entry
-                        .underlying
-                        .loader
-                        .load()
-                        .map_err(|_| StateError::InvalidAssetState)?,
-                );
+                underlying_guards[slot_index] = Some(entry.underlying.loader.load()?);
             }
         }
 
@@ -114,11 +96,11 @@ fn cleanup_with_transient_assets<'info>(
 
                 let market = market_guards[slot_index]
                     .as_ref()
-                    .ok_or(StateError::InvalidReference)?;
+                    .ok_or(StateError::MissingMarketObservation)?;
 
                 let underlying_asset = underlying_guards[slot_index]
                     .as_ref()
-                    .ok_or(StateError::InvalidReference)?;
+                    .ok_or(StateError::MissingUnderlyingObservation)?;
 
                 portfolio[slot_index] = Some(PortfolioMarketObservation {
                     market,
@@ -165,23 +147,10 @@ fn cleanup_with_transient_assets<'info>(
             }
         }
 
-        let mut refs: [std::mem::MaybeUninit<&mut MarketState>; MAX_MARKETS] =
-            core::array::from_fn(|_| std::mem::MaybeUninit::uninit());
-
-        for index in 0..count {
-            let guard = guards[index].as_mut().ok_or(StateError::InvalidReference)?;
-
-            let pointer = std::ptr::from_mut(&mut **guard);
-            // SAFETY: each pointer is derived from a live, unique RefMut held
-            // in `guards` until the borrowed slice is no longer used.
-            refs[index].write(unsafe { &mut *pointer });
-        }
-
-        let market_slice = unsafe {
-            std::slice::from_raw_parts_mut(refs.as_mut_ptr().cast::<&mut MarketState>(), count)
-        };
-
-        MarginGroup::close_only_cleanup(subaccount, market_slice)?;
+        MarginGroup::close_only_cleanup(
+            subaccount,
+            guards.iter_mut().flatten().map(|guard| &mut **guard),
+        )?;
     }
     Ok(())
 }
@@ -192,12 +161,9 @@ pub fn handle_close_only_cleanup<'info>(
     let mut subaccount = context.accounts.subaccount.load_mut()?;
 
     for info in context.remaining_accounts {
-        let loader = AccountLoader::<MarketState>::try_from(info)
-            .map_err(|_| error!(StateError::InvalidAccountInfo))?;
+        let loader = AccountLoader::<MarketState>::try_from(info)?;
 
-        let mut market = loader
-            .load_mut()
-            .map_err(|_| error!(StateError::InvalidMarket))?;
+        let mut market = loader.load_mut()?;
 
         if !market.is_close_only() {
             return Err(error!(StateError::InvalidStatus));

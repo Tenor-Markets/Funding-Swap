@@ -38,7 +38,7 @@ impl Side {
         } else if size < 0 {
             Ok(Self::Short)
         } else {
-            Err(StateError::InvalidConfiguration)
+            Err(StateError::ZeroOrderSize)
         }
     }
 }
@@ -69,7 +69,7 @@ impl TimeInForce {
     /// Validates a time-in-force value received at a public state boundary.
     pub fn validate(self) -> StateResult<()> {
         if self.0 > Self::SOFT_ALO.0 {
-            return Err(StateError::InvalidTag);
+            return Err(StateError::InvalidTimeInForce);
         }
 
         Ok(())
@@ -182,7 +182,7 @@ impl OrderBook {
         if absolute_size < self.minimum_order_size_atoms
             || absolute_size > self.maximum_order_size_atoms
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::OrderSizeOutOfBounds);
         }
 
         Ok(())
@@ -324,51 +324,94 @@ impl OrderBook {
         maximum_order_size_atoms: u64,
         maximum_open_orders_per_subaccount: u8,
     ) -> StateResult<()> {
-        if tick_step == 0
-            || tick_step > MAX_TICK_STEP
-            || minimum_order_size_atoms == 0
+        if tick_step == 0 || tick_step > MAX_TICK_STEP {
+            return Err(StateError::InvalidTickStep);
+        }
+        if minimum_order_size_atoms == 0
             || minimum_order_size_atoms > maximum_order_size_atoms
             || maximum_order_size_atoms
                 > u64::try_from(i64::MAX).expect("nonnegative signed maximum")
             || maximum_open_orders_per_subaccount == 0
             || usize::from(maximum_open_orders_per_subaccount) > MAX_ORDERS
         {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidOrderBookLimits);
         }
 
-        self.next_order_sequence = 1;
-        self.minimum_order_size_atoms = minimum_order_size_atoms;
-        self.maximum_order_size_atoms = maximum_order_size_atoms;
-        self.maximum_open_orders_per_subaccount = maximum_open_orders_per_subaccount;
-        self.tick_step = tick_step;
-        self.long_tick_directory.fill(FREE_INDEX);
-        self.short_tick_directory.fill(FREE_INDEX);
-
+        // Bind every field without constructing a book-sized stack temporary.
+        let Self {
+            long_bitmap: stored_long_bitmap,
+            short_bitmap: stored_short_bitmap,
+            long_tick_directory: stored_long_tick_directory,
+            short_tick_directory: stored_short_tick_directory,
+            tick_metadata: stored_tick_metadata,
+            nodes: stored_nodes,
+            next_order_sequence: stored_next_order_sequence,
+            minimum_order_size_atoms: stored_minimum_order_size_atoms,
+            maximum_order_size_atoms: stored_maximum_order_size_atoms,
+            free_node_head: stored_free_node_head,
+            free_tick_metadata_head: stored_free_tick_metadata_head,
+            maximum_open_orders_per_subaccount: stored_maximum_open_orders_per_subaccount,
+            tick_step: stored_tick_step,
+            _pad_0: stored_pad_0,
+            reserved: stored_reserved,
+        } = self;
+        for bitmap in [stored_long_bitmap, stored_short_bitmap] {
+            let HierarchicalBitmap {
+                level_zero,
+                level_one,
+                top,
+            } = bitmap;
+            level_zero.fill(0);
+            level_one.fill(0);
+            *top = 0;
+        }
+        stored_long_tick_directory.fill(FREE_INDEX);
+        stored_short_tick_directory.fill(FREE_INDEX);
         for index in 0..BOOK_CAPACITY {
-            self.tick_metadata[index] = TickMetadata {
+            stored_tick_metadata[index] = TickMetadata {
+                tick: 0,
                 head: FREE_INDEX,
                 tail: FREE_INDEX,
                 next_free: if index + 1 < BOOK_CAPACITY {
-                    u16::try_from(index + 1).map_err(|_| StateError::ArithmeticOverflow)?
+                    u16::try_from(index + 1).expect("bounded book index")
                 } else {
                     FREE_INDEX
                 },
-                ..TickMetadata::zeroed()
+                _pad_0: [0; 1],
+                reserved: [0; TICK_METADATA_RESERVED],
+                _pad_1: [0; 1],
             };
-
-            self.nodes[index] = OrderNode {
+            stored_nodes[index] = OrderNode {
+                sequence: 0,
+                expiry_timestamp: 0,
+                size: 0,
+                remaining_size: 0,
+                pending_floating_index_basis: FixedPoint::zeroed(),
+                pending_fee_index_basis: FixedPoint::zeroed(),
+                pending_fixed_payment_atoms: 0,
+                maker_subaccount: Pubkey::default(),
                 previous_node: FREE_INDEX,
                 next_node: if index + 1 < BOOK_CAPACITY {
-                    u16::try_from(index + 1).map_err(|_| StateError::ArithmeticOverflow)?
+                    u16::try_from(index + 1).expect("bounded book index")
                 } else {
                     FREE_INDEX
                 },
-                ..OrderNode::zeroed()
+                tick: 0,
+                time_in_force: TimeInForce::default(),
+                _pad_0: [0; 3],
+                reserved: [0; ORDER_NODE_RESERVED],
+                _pad_1: [0; 6],
             };
         }
-
-        self.free_node_head = 0;
-        self.free_tick_metadata_head = 0;
+        *stored_next_order_sequence = 1;
+        *stored_minimum_order_size_atoms = minimum_order_size_atoms;
+        *stored_maximum_order_size_atoms = maximum_order_size_atoms;
+        *stored_free_node_head = 0;
+        *stored_free_tick_metadata_head = 0;
+        *stored_maximum_open_orders_per_subaccount = maximum_open_orders_per_subaccount;
+        *stored_tick_step = tick_step;
+        *stored_pad_0 = [0; 2];
+        *stored_reserved = [0; ORDER_BOOK_RESERVED];
 
         Ok(())
     }
@@ -454,7 +497,7 @@ impl OrderBook {
         if self.free_node_head == FREE_INDEX
             || (metadata_index.is_none() && self.free_tick_metadata_head == FREE_INDEX)
         {
-            return Err(StateError::CapacityExhausted);
+            return Err(StateError::BookCapacityExhausted);
         }
 
         let index = usize::from(self.free_node_head);
@@ -544,7 +587,7 @@ impl OrderBook {
         // A live node always has metadata, we keep an explicit error instead of unwrapping.
         let metadata_index = self
             .get_metadata(side, tick)
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::MissingTickMetadata)?;
 
         if self.tick_metadata[metadata_index].tail
             == u16::try_from(index).expect("bounded book index")
@@ -590,7 +633,7 @@ impl OrderBook {
         // A live node always has metadata, we keep an explicit error instead of unwrapping.
         let metadata_index = self
             .get_metadata(side, tick)
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::MissingTickMetadata)?;
 
         let previous = self.nodes[index].previous_node;
         let next = self.nodes[index].next_node;
@@ -642,7 +685,7 @@ impl OrderBook {
         // A live node always has metadata, we keep an explicit error instead of unwrapping.
         let metadata = self
             .get_metadata(side, tick)
-            .ok_or(StateError::InvalidReference)?;
+            .ok_or(StateError::MissingTickMetadata)?;
 
         Ok(Some(usize::from(self.tick_metadata[metadata].head)))
     }

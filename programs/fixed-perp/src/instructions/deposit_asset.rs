@@ -7,30 +7,30 @@ use crate::state::{AssetState, MarginGroup, StateError, Subaccount};
 pub struct DepositAsset<'info> {
     pub depositor: Signer<'info>,
     #[account(
-        mut, 
-        token::mint = mint, 
+        mut,
+        token::mint = mint,
         token::authority = depositor
     )]
     pub source: Account<'info, TokenAccount>,
     pub mint: Account<'info, Mint>,
     #[account(
-        mut, 
-        token::mint = mint, 
+        mut,
+        token::mint = mint,
         token::authority = asset
     )]
     pub token_vault: Account<'info, TokenAccount>,
     #[account(
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = asset.load()?.is_valid_custody(token_vault.key()) @ StateError::InvalidReference
+        constraint = asset.load()?.is_valid_custody(token_vault.key()) @ StateError::InvalidTargetCustody
     )]
     pub asset: AccountLoader<'info, AssetState>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidKey
+        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidAccountKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
     #[account(
-        mut, 
+        mut,
         constraint = beneficiary.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID)]
     pub beneficiary: AccountLoader<'info, Subaccount>,
     pub token_program: Program<'info, Token>,

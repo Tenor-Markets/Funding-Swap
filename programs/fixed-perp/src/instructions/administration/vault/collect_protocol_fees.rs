@@ -13,18 +13,18 @@ pub struct CollectProtocolFees<'info> {
     #[account(
         mut,
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = asset.load()?.is_valid_custody(token_vault.key()) @ StateError::InvalidReference
+        constraint = asset.load()?.is_valid_custody(token_vault.key()) @ StateError::InvalidTargetCustody
     )]
     pub asset: AccountLoader<'info, AssetState>,
     pub mint: Account<'info, Mint>,
     #[account(
-        mut, 
-        token::mint = mint, 
+        mut,
+        token::mint = mint,
         token::authority = asset
     )]
     pub token_vault: Account<'info, TokenAccount>,
     #[account(
-        mut, 
+        mut,
         token::mint = mint
     )]
     pub destination: Account<'info, TokenAccount>,
@@ -42,19 +42,16 @@ pub fn handle_collect_protocol_fees<'info>(
         let mut loaders = Vec::with_capacity(context.remaining_accounts.len());
 
         for account in context.remaining_accounts {
-            loaders.push(
-                AccountLoader::<MarketState>::try_from(account)
-                    .map_err(|_| StateError::InvalidMarket)?,
-            );
+            loaders.push(AccountLoader::<MarketState>::try_from(account)?);
         }
 
         let mut markets = Vec::with_capacity(loaders.len());
 
         for loader in &loaders {
-            let market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+            let market = loader.load_mut()?;
 
-            if !market.config.is_same_collateral_state(asset_state){
-                return Err(StateError::InvalidConfiguration.into());
+            if !market.config.is_same_collateral_state(asset_state) {
+                return Err(StateError::MarketAssetMismatch.into());
             }
 
             markets.push(market);

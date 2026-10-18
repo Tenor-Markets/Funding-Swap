@@ -26,10 +26,9 @@ fn close_market_for_slot<'info>(
     let market_id = subaccount.markets[slot_index].market_id;
 
     for account_info in remaining_accounts {
-        let loader = AccountLoader::<MarketState>::try_from(account_info)
-            .map_err(|_| StateError::InvalidAccountInfo)?;
+        let loader = AccountLoader::<MarketState>::try_from(account_info)?;
 
-        let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+        let mut market = loader.load_mut()?;
 
         if market.config.market_id == market_id {
             subaccount.close_market(slot_index, &mut market)?;
@@ -38,7 +37,7 @@ fn close_market_for_slot<'info>(
         }
     }
 
-    Err(StateError::AccountNotFound.into())
+    Err(StateError::MissingMarketAccount.into())
 }
 
 /// Closes only market slots whose position, settlement balance, and order

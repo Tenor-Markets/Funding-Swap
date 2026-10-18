@@ -65,7 +65,7 @@ impl TryFrom<u8> for GovernanceCategory {
             5 => Ok(Self::Resources),
             6 => Ok(Self::Treasury),
             7 => Ok(Self::AuthorityAdministration),
-            _ => Err(StateError::InvalidTag),
+            _ => Err(StateError::InvalidGovernanceCategory),
         }
     }
 }
@@ -117,10 +117,11 @@ impl GlobalGovernanceConfig {
     }
 
     pub fn validate(&self) -> StateResult<()> {
-        if self.authorities.contains(&Pubkey::default())
-            || self.subaccount_creation_fee_destination == Pubkey::default()
-        {
-            return Err(StateError::InvalidConfiguration);
+        if self.authorities.contains(&Pubkey::default()) {
+            return Err(StateError::InvalidGovernanceAuthority);
+        }
+        if self.subaccount_creation_fee_destination == Pubkey::default() {
+            return Err(StateError::InvalidCreationFeeDestination);
         }
 
         Ok(())
@@ -148,7 +149,7 @@ pub struct UpdateAuthoritiesArgs {
 impl UpdateAuthoritiesArgs {
     pub fn apply(&self, config: &mut GlobalGovernanceConfig) -> StateResult<()> {
         if self.target_category.is_some() != self.new_authority.is_some() {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::IncompleteAuthorityUpdate);
         }
 
         let mut next = *config;
@@ -182,7 +183,7 @@ fn update_directional<T: Ord + Copy>(
 ) -> StateResult<()> {
     if let Some(value) = target {
         if (increase && value < *current) || (!increase && value > *current) {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::RiskUpdateWrongDirection);
         }
 
         *current = value;
@@ -244,7 +245,7 @@ impl UpdateMarketRiskArgs {
 
         if let Some(value) = self.minimum_position_size_atoms {
             if tightening {
-                return Err(StateError::InvalidAuthority);
+                return Err(StateError::RecoveryAuthorityRequired);
             }
             next.minimum_position_size_atoms = value;
         }
@@ -263,7 +264,7 @@ impl UpdateMarketRiskArgs {
 
         if let Some(value) = self.mark_observation_window_seconds {
             if tightening {
-                return Err(StateError::InvalidAuthority);
+                return Err(StateError::RecoveryAuthorityRequired);
             }
 
             next.mark_observation_window_seconds = value;
@@ -322,7 +323,7 @@ impl UpdateGroupRiskArgs {
         )?;
 
         if critical.to_raw_bits() <= 0 || cancellation.to_raw_bits() < critical.to_raw_bits() {
-            return Err(StateError::InvalidConfiguration);
+            return Err(StateError::InvalidGroupHealthRatios);
         }
 
         group.critical_health_ratio = critical;
@@ -424,7 +425,7 @@ pub fn update_market_status(
     };
 
     if !allowed {
-        return Err(StateError::InvalidStatus);
+        return Err(StateError::InvalidMarketStatusTransition);
     }
 
     market.status.0 = status;

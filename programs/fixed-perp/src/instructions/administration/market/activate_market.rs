@@ -10,9 +10,9 @@ pub struct ActivateMarket<'info> {
     )]
     pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
     #[account(
-        mut, 
+        mut,
         constraint = market.load()?.is_pending() && market.load()?.is_seeded() @ StateError::InvalidStatus,
-        constraint = market.load()?.can_start(Clock::get()?.unix_timestamp) @ StateError::Conflict
+        constraint = market.load()?.can_start(Clock::get()?.unix_timestamp) @ StateError::MarketAlreadyStarted
     )]
     pub market: AccountLoader<'info, MarketState>,
 }

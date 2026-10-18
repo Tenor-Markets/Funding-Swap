@@ -20,7 +20,7 @@ pub struct Liquidate<'info> {
     pub liquidator: AccountLoader<'info, Subaccount>,
     #[account(
         mut,
-        constraint = victim.key() != liquidator.key() @ StateError::Conflict,
+        constraint = victim.key() != liquidator.key() @ StateError::DuplicateSubaccount,
         constraint = victim.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID
     )]
     pub victim: AccountLoader<'info, Subaccount>,
@@ -79,10 +79,7 @@ pub fn handle_liquidate<'info>(
     let (incentive, fee, liquidator_cash) = {
         let mut victim = context.accounts.victim.load_mut()?;
         let mut liquidator = context.accounts.liquidator.load_mut()?;
-        let mut market = entry
-            .loader
-            .load_mut()
-            .map_err(|_| StateError::InvalidMarket)?;
+        let mut market = entry.loader.load_mut()?;
         market.liquidate(
             &mut victim,
             &mut liquidator,
@@ -99,7 +96,7 @@ pub fn handle_liquidate<'info>(
             let market = entry.loader.load()?;
             let slot = liquidator
                 .lookup_market(market_id)
-                .ok_or(StateError::NotFound)?;
+                .ok_or(StateError::MarketNotEntered)?;
             let post = &liquidator.markets[slot];
             let action = market.closing_action(
                 pre_liquidator_position,
@@ -140,10 +137,7 @@ pub(crate) fn materialize_entered<'info, const N: usize>(
             continue;
         }
         let entry = market_observation_for(observations, market_id)?;
-        let mut market = entry
-            .loader
-            .load_mut()
-            .map_err(|_| StateError::InvalidMarket)?;
+        let mut market = entry.loader.load_mut()?;
         materialize_market(subaccount, &mut market, slot_index)?;
     }
     Ok(())
@@ -174,16 +168,8 @@ fn portfolio_health<'info, const N: usize>(
     now: i64,
     maintenance: bool,
 ) -> Result<PortfolioHealth> {
-    let collateral_guard = observations
-        .collateral
-        .loader
-        .load()
-        .map_err(|_| StateError::InvalidAssetState)?;
-    let settlement_guard = observations
-        .settlement
-        .loader
-        .load()
-        .map_err(|_| StateError::InvalidAssetState)?;
+    let collateral_guard = observations.collateral.loader.load()?;
+    let settlement_guard = observations.settlement.loader.load()?;
     let mut market_guards: [Option<Ref<'_, MarketState>>; MAX_MARKETS] =
         core::array::from_fn(|_| None);
     let mut underlying_guards: [Option<Ref<'_, AssetState>>; MAX_MARKETS] =
@@ -193,15 +179,8 @@ fn portfolio_health<'info, const N: usize>(
             continue;
         }
         let entry = market_observation_for(observations, slot.market_id)?;
-        market_guards[slot_index] =
-            Some(entry.loader.load().map_err(|_| StateError::InvalidMarket)?);
-        underlying_guards[slot_index] = Some(
-            entry
-                .underlying
-                .loader
-                .load()
-                .map_err(|_| StateError::InvalidAssetState)?,
-        );
+        market_guards[slot_index] = Some(entry.loader.load()?);
+        underlying_guards[slot_index] = Some(entry.underlying.loader.load()?);
     }
     let mut portfolio: [Option<PortfolioMarketObservation<'_>>; MAX_MARKETS] = [None; MAX_MARKETS];
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
@@ -212,10 +191,10 @@ fn portfolio_health<'info, const N: usize>(
         portfolio[slot_index] = Some(PortfolioMarketObservation {
             market: market_guards[slot_index]
                 .as_ref()
-                .ok_or(StateError::InvalidReference)?,
+                .ok_or(StateError::MissingMarketObservation)?,
             underlying_asset: underlying_guards[slot_index]
                 .as_ref()
-                .ok_or(StateError::InvalidReference)?,
+                .ok_or(StateError::MissingUnderlyingObservation)?,
             underlying: entry.underlying.observation,
         });
     }

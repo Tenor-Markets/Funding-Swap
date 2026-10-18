@@ -55,17 +55,16 @@ fn market_account_for_slot<'info>(
     let market_id = subaccount.markets[slot_index].market_id;
 
     for account_info in remaining_accounts {
-        let loader = AccountLoader::<MarketState>::try_from(account_info)
-            .map_err(|_| StateError::InvalidAccountInfo)?;
+        let loader = AccountLoader::<MarketState>::try_from(account_info)?;
 
-        let market = loader.load().map_err(|_| StateError::InvalidMarket)?;
+        let market = loader.load()?;
 
         if market.config.market_id == market_id {
             return Ok(account_info);
         }
     }
 
-    Err(StateError::InvalidMarket.into())
+    Err(StateError::MissingMarketAccount.into())
 }
 
 fn prepare_market_settlement(
@@ -87,7 +86,7 @@ fn prepare_market_settlement(
     if market.config.collateral_state != collateral_state
         || market.config.settlement_state != settlement_state
     {
-        return Err(StateError::Conflict);
+        return Err(StateError::MarketAssetMismatch);
     }
 
     materialize_market(subaccount, market, slot_index)?;
@@ -102,7 +101,7 @@ fn prepare_market_settlement(
     let ratio = if market.is_matured() {
         market
             .frozen_settlement_ratio()
-            .ok_or(StateError::InvalidStatus)?
+            .ok_or(StateError::MissingSettlementRatio)?
     } else if collateral_state == settlement_state {
         SettlementRatio::new(1, 1)?
     } else {
@@ -162,8 +161,8 @@ fn reject_duplicate_markets(supplied: &SuppliedMarkets<'_>) -> Result<()> {
     let mut market_ids = [0u64; MAX_MARKETS];
 
     for (index, loader) in supplied.loaders.iter().enumerate().take(supplied.count) {
-        let loader = loader.as_ref().ok_or(StateError::InvalidMarket)?;
-        let market = loader.load().map_err(|_| StateError::InvalidMarket)?;
+        let loader = loader.as_ref().ok_or(StateError::MissingMarketAccount)?;
+        let market = loader.load()?;
         let market_id = market.config.market_id;
 
         if market_ids[..index].contains(&market_id) {
@@ -196,7 +195,7 @@ pub fn handle_settle_market_into_collateral<'info>(
 
         subaccount
             .lookup_market(market.config.market_id)
-            .ok_or(StateError::InvalidMarket)?
+            .ok_or(StateError::MarketNotEntered)?
     };
 
     {
@@ -235,12 +234,12 @@ pub fn handle_settle_all_markets_into_collateral<'info>(
     let mut subaccount = context.accounts.subaccount.load_mut()?;
 
     for loader in supplied.loaders.iter().take(supplied.count) {
-        let loader = loader.as_ref().ok_or(StateError::InvalidMarket)?;
-        let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+        let loader = loader.as_ref().ok_or(StateError::MissingMarketAccount)?;
+        let mut market = loader.load_mut()?;
 
         let slot_index = subaccount
             .lookup_market(market.config.market_id)
-            .ok_or(StateError::InvalidMarket)?;
+            .ok_or(StateError::MarketNotEntered)?;
 
         prepare_market_settlement(
             &mut subaccount,
@@ -266,10 +265,9 @@ pub fn handle_settle_matured_markets<'info>(
         let market_info =
             market_account_for_slot(&subaccount, slot_index, context.remaining_accounts)?;
 
-        let loader = AccountLoader::<MarketState>::try_from(market_info)
-            .map_err(|_| StateError::InvalidAccountInfo)?;
+        let loader = AccountLoader::<MarketState>::try_from(market_info)?;
 
-        let mut market = loader.load_mut().map_err(|_| StateError::InvalidMarket)?;
+        let mut market = loader.load_mut()?;
 
         if market.is_matured() {
             materialize_market(&mut subaccount, &mut market, slot_index)?;
