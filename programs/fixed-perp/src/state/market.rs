@@ -2222,7 +2222,8 @@ impl MarketState {
     }
 
     /// Changes a materialized order's remaining size, located by its stable
-    /// order ID. A zero size takes the close path.
+    /// order ID. The caller handles zero-sized cancellation separately. Returns
+    /// whether the remaining size increases and requires an initial-margin check.
     ///
     /// The caller establishes the market slot and materializes this subaccount
     /// first. The ID locates the exact node and maker reference and rejects a
@@ -2235,11 +2236,7 @@ impl MarketState {
         subaccount: &mut Subaccount,
         order_id: OrderId,
         new_size: i64,
-    ) -> StateResult<()> {
-        if new_size == 0 {
-            return self.close_order(subaccount, order_id);
-        }
-
+    ) -> StateResult<bool> {
         let slot_index = subaccount
             .lookup_market(self.config.market_id)
             .ok_or(StateError::MarketNotEntered)?;
@@ -2269,7 +2266,7 @@ impl MarketState {
         let new_size_abs = new_size.unsigned_abs();
 
         if new_size_abs == old_size {
-            return Ok(());
+            return Ok(false);
         }
 
         let increases = new_size_abs > old_size;
@@ -2323,7 +2320,7 @@ impl MarketState {
 
         subaccount.markets[slot_index].order_risk = next_risk;
 
-        Ok(())
+        Ok(increases)
     }
 
     /// Applies same-market stable-ID size changes after the caller establishes

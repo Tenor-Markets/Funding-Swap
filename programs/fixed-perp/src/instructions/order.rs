@@ -312,6 +312,10 @@ pub fn handle_modify_order<'info>(
         return handle_cancel_order(context, args.sequence, args.slab_index);
     }
 
+    if !execute_modify_order(context.accounts, args)? {
+        return Ok(());
+    }
+
     let now = Clock::get()?.unix_timestamp;
 
     let group = context.accounts.margin_group.load()?;
@@ -323,43 +327,35 @@ pub fn handle_modify_order<'info>(
         now,
     )?;
 
-    execute_modify_order(context.accounts, &group, &observations, now, args)
+    let mut subaccount = context.accounts.subaccount.load_mut()?;
+
+    materialize_other_markets(&mut subaccount, &observations, context.accounts.market.key())?;
+
+    check_initial_health(&group, &subaccount, &observations, now)
 }
 
 #[inline(never)]
 fn execute_modify_order<'info>(
     accounts: &OrderAccounts<'info>,
-    group: &MarginGroup,
-    observations: &ObservationSet<'info>,
-    now: i64,
     args: ModifyOrderArgs,
-) -> Result<()> {
+) -> Result<bool> {
     let mut subaccount = accounts.subaccount.load_mut()?;
+    let mut market = accounts.market.load_mut()?;
 
-    {
-        let mut market = accounts.market.load_mut()?;
+    let slot_index = subaccount
+        .lookup_market(market.config.market_id)
+        .ok_or(StateError::MarketNotEntered)?;
 
-        let slot_index = subaccount
-            .lookup_market(market.config.market_id)
-            .ok_or(StateError::MarketNotEntered)?;
+    materialize_market(&mut subaccount, &mut market, slot_index)?;
 
-        materialize_market(&mut subaccount, &mut market, slot_index)?;
-
-        market.modify_order(
-            &mut subaccount,
-            crate::state::OrderId {
-                sequence: args.sequence,
-                slab_index: args.slab_index,
-            },
-            args.new_size,
-        )?;
-    }
-
-    materialize_other_markets(&mut subaccount, observations, accounts.market.key())?;
-
-    check_initial_health(group, &subaccount, observations, now)?;
-
-    Ok(())
+    Ok(market.modify_order(
+        &mut subaccount,
+        crate::state::OrderId {
+            sequence: args.sequence,
+            slab_index: args.slab_index,
+        },
+        args.new_size,
+    )?)
 }
 
 pub fn handle_close_all_orders<'info>(context: Context<'info, OrderAccounts<'info>>) -> Result<()> {

@@ -153,7 +153,6 @@ impl SettlementRatio {
             return Err(StateError::InvalidSettlementRatio);
         }
 
-        // TODO: This seems to conflict with the comment above the function.
         let mut numerator = u128::from(settlement_price);
         let mut denominator = u128::from(collateral_price);
 

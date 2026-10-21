@@ -462,7 +462,6 @@ impl OrderRiskAggregate {
             .checked_sub(size)
             .ok_or(StateError::OrderRiskAccountingMismatch)?;
 
-        // TODO: Why can't pm be negative?
         let next_pm = current_pm
             .checked_sub(contribution)
             .filter(|value| *value >= 0)
