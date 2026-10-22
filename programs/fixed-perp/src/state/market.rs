@@ -603,13 +603,12 @@ impl MarketState {
             .ok_or(StateError::ArithmeticOverflow)?;
 
         let mark = self.current_mark_rate(now)?;
-        let no_orders = super::OrderRiskAggregate::zeroed();
         let margin_before = self.maintenance_margin(
-            self.risk_principal(old_victim, &no_orders, mark)?,
+            self.position_risk_principal(old_victim, mark)?,
             time_to_maturity,
         )?;
         let margin_after = self.maintenance_margin(
-            self.risk_principal(new_victim, &no_orders, mark)?,
+            self.position_risk_principal(new_victim, mark)?,
             time_to_maturity,
         )?;
         // Boros subtracts the two maintenance margins as uints, so an increase
@@ -3125,6 +3124,7 @@ impl MarketState {
     /// Returns the conservative-ceiling maintenance margin in settlement atoms:
     /// `ceil(risk_principal * maintenance_margin_factor *
     /// max(time_to_maturity, margin_time_threshold) / one_year)`.
+    /// Callers supply position-only risk; resting orders reserve initial margin.
     pub fn maintenance_margin(
         &self,
         risk_principal: FixedPoint,
@@ -3135,6 +3135,22 @@ impl MarketState {
             self.config.maintenance_margin_factor,
             time_to_maturity,
         )
+    }
+
+    /// Position-only potential margin used by maintenance-margin calculations.
+    fn position_risk_principal(
+        &self,
+        position_size: i64,
+        mark_rate: FixedPoint,
+    ) -> StateResult<FixedPoint> {
+        Ok(FixedPoint::from_raw_bits(
+            super::OrderRiskAggregate::pm_contribution(
+                position_size.unsigned_abs(),
+                mark_rate,
+                self.config.rate_floor,
+                self.order_risk_scale(),
+            )?,
+        ))
     }
 
     /// Returns the aggregated risk principal: the Q64.64
@@ -3150,14 +3166,7 @@ impl MarketState {
         order_risk: &super::OrderRiskAggregate,
         mark_rate: FixedPoint,
     ) -> StateResult<FixedPoint> {
-        let position_abs = position_size.unsigned_abs();
-
-        let pm_alone = FixedPoint::from_raw_bits(super::OrderRiskAggregate::pm_contribution(
-            position_abs,
-            mark_rate,
-            self.config.rate_floor,
-            self.order_risk_scale(),
-        )?);
+        let pm_alone = self.position_risk_principal(position_size, mark_rate)?;
 
         let total_long = Self::side_pm_total(
             position_size,
@@ -3256,15 +3265,15 @@ impl MarketState {
     /// Returns the single authoritative post-batch aggregate closing-action
     /// classification and its strict-IM decision.
     ///
-    /// Inputs are the pre-batch settled position and order risk, the
+    /// Inputs are the pre-batch settled position, the
     /// post-batch final position and final aggregate order risk (whose
     /// `sum_long_order_size`/`sum_short_order_size` carry the final aggregate
     /// order sizes), the side of any newly resting order, the close-only exemption, the
     /// account's validated critical-health ratio, the net payment including
     /// fees `P`, the worst rate among newly resting closing orders, and the
     /// current clock. Callers must have materialized every pending fill
-    /// first: `final_value` is a realized position valuation only, and resting
-    /// orders enter the final margin risk separately.
+    /// first. Maintenance margin uses only realized positions; resting orders
+    /// still participate in closing-action classification and initial margin.
     ///
     /// An exposure-increasing action always requires strict IM. A genuinely
     /// closing action bypasses strict IM only when the Boros closing-order
@@ -3275,7 +3284,6 @@ impl MarketState {
     pub fn closing_action(
         &self,
         pre_position_size: i64,
-        pre_order_risk: &super::OrderRiskAggregate,
         post_position_size: i64,
         post_order_risk: &super::OrderRiskAggregate,
         new_resting_order_side: Option<Side>,
@@ -3294,7 +3302,7 @@ impl MarketState {
             .ok_or(StateError::InvalidClock)?;
 
         let final_value = self.position_value(post_position_size, mark, time_to_maturity)?;
-        let final_risk = self.risk_principal(post_position_size, post_order_risk, mark)?;
+        let final_risk = self.position_risk_principal(post_position_size, mark)?;
         let final_margin = self.maintenance_margin(final_risk, time_to_maturity)?;
         let is_closing_action = aggregate_is_closing_action(
             pre_position_size,
@@ -3347,7 +3355,7 @@ impl MarketState {
             // ratio product floored. The close-only
             // exemption never enters this relief decision.
             let pre_value = self.position_value(pre_position_size, mark, time_to_maturity)?;
-            let pre_risk = self.risk_principal(pre_position_size, pre_order_risk, mark)?;
+            let pre_risk = self.position_risk_principal(pre_position_size, mark)?;
             let pre_margin = self.maintenance_margin(pre_risk, time_to_maturity)?;
 
             let value_consumed = pre_value
@@ -3830,11 +3838,16 @@ impl MarginGroup {
                 )
                 .ok_or(StateError::ArithmeticOverflow)?;
 
-            let risk = market.risk_principal(slot.position_size, &slot.order_risk, mark)?;
-
+            // Resting orders reserve initial margin but do not contribute to maintenance margin.
             let margin = match requirement_type {
-                MarginRequirementType::Initial => market.initial_margin(risk, time)?,
-                MarginRequirementType::Maintenance => market.maintenance_margin(risk, time)?,
+                MarginRequirementType::Initial => {
+                    let risk = market.risk_principal(slot.position_size, &slot.order_risk, mark)?;
+                    market.initial_margin(risk, time)?
+                }
+                MarginRequirementType::Maintenance => {
+                    let risk = market.position_risk_principal(slot.position_size, mark)?;
+                    market.maintenance_margin(risk, time)?
+                }
             };
 
             let margin = self.settlement_factors.apply(-margin)?;

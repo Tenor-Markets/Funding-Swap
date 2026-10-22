@@ -100,7 +100,6 @@ pub fn handle_liquidate<'info>(
             let post = &liquidator.markets[slot];
             let action = market.closing_action(
                 pre_liquidator_position,
-                &post.order_risk,
                 post.position_size,
                 &post.order_risk,
                 None,
