@@ -10,7 +10,7 @@ use super::user::OrderRiskScale;
 use super::{
     AssetState, FixedPoint, OracleObservation, OrderBook, OrderId, OrderRef, PriceEndpoint,
     SettlementRatio, Side, StateError, StateResult, Subaccount, TimeInForce, ValuationFactors,
-    BOOK_CAPACITY,
+    BOOK_CAPACITY, FREE_INDEX,
 };
 
 pub use fixed_perp_math::rate::SECONDS_PER_YEAR;
@@ -121,6 +121,12 @@ struct MatchTotals {
     fixed_payment_atoms: i128,
     taker_fee_atoms: u128,
     last_matched_tick: Option<i16>,
+}
+
+struct AffordableFill {
+    maker_fill: i64,
+    fixed_payment_atoms: i128,
+    totals: MatchTotals,
 }
 
 struct RestingOrder {
@@ -904,7 +910,7 @@ impl MarketState {
     }
 
     /// Finds the largest amount from one node that remains within the aggregate payment cap.
-    fn affordable_fill_size(
+    fn affordable_fill(
         &self,
         candidate: u64,
         maker_side: Side,
@@ -912,12 +918,12 @@ impl MarketState {
         time_to_maturity: i64,
         maximum_payment_atoms: u128,
         totals: &MatchTotals,
-    ) -> StateResult<u64> {
+    ) -> StateResult<Option<AffordableFill>> {
         // Affordability is monotonic over size, so retain the largest passing
         // prefix of this node rather than testing every possible fill amount.
         let mut low = 1u64;
         let mut high = candidate;
-        let mut accepted = 0u64;
+        let mut accepted = None;
 
         while low <= high {
             let middle = low + (high - low) / 2;
@@ -931,13 +937,11 @@ impl MarketState {
                 .checked_add(payment)
                 .ok_or(StateError::ArithmeticOverflow)?;
 
-            let fee = self.taker_fee_atoms(
-                totals
-                    .filled_size
-                    .checked_add(middle)
-                    .ok_or(StateError::ArithmeticOverflow)?,
-                time_to_maturity,
-            )?;
+            let filled_size = totals
+                .filled_size
+                .checked_add(middle)
+                .ok_or(StateError::ArithmeticOverflow)?;
+            let fee = self.taker_fee_atoms(filled_size, time_to_maturity)?;
 
             let cash = fixed
                 .checked_neg()
@@ -947,7 +951,16 @@ impl MarketState {
             if Self::cash_debit_atoms(cash) <= maximum_payment_atoms {
                 // This size fits; search the larger half while retaining it as
                 // the best known fill in case every larger size exceeds the cap.
-                accepted = middle;
+                accepted = Some(AffordableFill {
+                    maker_fill: fill,
+                    fixed_payment_atoms: payment,
+                    totals: MatchTotals {
+                        filled_size,
+                        fixed_payment_atoms: fixed,
+                        taker_fee_atoms: fee,
+                        last_matched_tick: Some(tick),
+                    },
+                });
 
                 low = middle
                     .checked_add(1)
@@ -1711,16 +1724,21 @@ impl MarketState {
         let start_fee = totals.taker_fee_atoms;
         let mut remaining = size;
 
-        // To do: We can and should optimize this loop to tread along orders with the same tick and call
-        // `best_head` again when we have exhausted all orders at that tick.
+        let mut head = self.order_book.best_head(maker_side)?;
         while remaining != 0 {
-            let Some(node_index) = self.order_book.best_head(maker_side)? else {
+            let Some(node_index) = head else {
                 break;
             };
 
-            let (maker_subaccount, maker_remaining_size, maker_tick) = {
+            let (maker_subaccount, maker_remaining_size, maker_tick, next_node) = {
                 let node = &self.order_book.nodes[node_index];
-                (node.maker_subaccount, node.remaining_size, node.tick)
+                // Full fills detach the node and clear its links, so retain the next FIFO node.
+                (
+                    node.maker_subaccount,
+                    node.remaining_size,
+                    node.tick,
+                    node.next_node,
+                )
             };
 
             if !Self::tick_is_matchable(side, limit_tick, maker_tick) {
@@ -1735,21 +1753,18 @@ impl MarketState {
                 .unsigned_abs()
                 .min(maker_remaining_size.unsigned_abs());
 
-            // TODO: Get this to return the info we use below, so we don't recompute it.
-            let fill_abs = self.affordable_fill_size(
+            let Some(fill) = self.affordable_fill(
                 candidate,
                 maker_side,
                 maker_tick,
                 time_to_maturity,
                 maximum_payment_atoms,
                 totals,
-            )?;
-
-            if fill_abs == 0 {
+            )? else {
                 break;
-            }
+            };
 
-            let maker_fill = Self::signed_amount(fill_abs, maker_side)?;
+            let maker_fill = fill.maker_fill;
 
             let taker_fill = maker_fill
                 .checked_neg()
@@ -1766,38 +1781,31 @@ impl MarketState {
                 )?;
             }
 
-            let payment = self.fixed_payment_atoms(maker_fill, maker_tick, time_to_maturity)?;
-
-            let next_fixed = totals
-                .fixed_payment_atoms
-                .checked_add(payment)
-                .ok_or(StateError::ArithmeticOverflow)?;
-
-            let next_filled = totals
-                .filled_size
-                .checked_add(fill_abs)
-                .ok_or(StateError::ArithmeticOverflow)?;
-
-            let next_fee = self.taker_fee_atoms(next_filled, time_to_maturity)?;
-
             self.apply_maker_match_and_taker_fill(
                 taker,
                 taker_slot,
                 node_index,
                 taker_fill,
-                payment,
-                next_fee
+                fill.fixed_payment_atoms,
+                fill.totals
+                    .taker_fee_atoms
                     .checked_sub(totals.taker_fee_atoms)
                     .ok_or(StateError::ArithmeticOverflow)?,
             )?;
 
-            totals.filled_size = next_filled;
-            totals.fixed_payment_atoms = next_fixed;
-            totals.taker_fee_atoms = next_fee;
-            totals.last_matched_tick = Some(maker_tick);
+            *totals = fill.totals;
+
             remaining = remaining
                 .checked_sub(taker_fill)
                 .ok_or(StateError::ArithmeticOverflow)?;
+
+            if remaining != 0 && maker_fill == maker_remaining_size {
+                head = if next_node == FREE_INDEX {
+                    self.order_book.best_head(maker_side)?
+                } else {
+                    Some(usize::from(next_node))
+                };
+            }
         }
 
         Ok(PlaceOrderResult {
