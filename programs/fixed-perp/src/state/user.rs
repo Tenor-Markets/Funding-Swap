@@ -261,16 +261,12 @@ impl Subaccount {
     /// open so callers cannot close around an unsettled obligation.  A
     /// non-zero position is the expired contract itself and is retired here
     /// after all pending orders have already been cancelled by the caller.
+    /// The caller must establish that the market is matured.
     pub fn settle_and_close_market(
         &mut self,
         market_slot_index: usize,
         market: &mut MarketState,
     ) -> StateResult<()> {
-        // TODO: Remove the two checks below, the callers handle this.
-        if !market.is_matured() {
-            return Err(StateError::MarketNotMatured);
-        }
-
         let ratio = market
             .frozen_settlement_ratio()
             .ok_or(StateError::MissingSettlementRatio)?;

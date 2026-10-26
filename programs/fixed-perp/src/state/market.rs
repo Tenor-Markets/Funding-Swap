@@ -1921,6 +1921,7 @@ impl MarketState {
                     time_in_force: order_intent.time_in_force,
                     expiry_timestamp: order_intent.expiry_timestamp,
                 },
+                true,
             )?);
         }
 
@@ -2026,8 +2027,42 @@ impl MarketState {
                         time_in_force: intent.time_in_force,
                         expiry_timestamp: order.expiry_timestamp,
                     },
+                    false,
                 )?);
             }
+        }
+
+        if results.iter().any(|result| result.resting_order.is_some()) {
+            self.validate_resting_close_only(
+                taker,
+                taker_slot,
+                intent.side,
+                &taker.markets[taker_slot].order_risk,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Validates projected single-order risk or the final same-side batch aggregate.
+    fn validate_resting_close_only(
+        &self,
+        subaccount: &Subaccount,
+        slot_index: usize,
+        side: Side,
+        risk: &super::OrderRiskAggregate,
+    ) -> StateResult<()> {
+        let slot = &subaccount.markets[slot_index];
+        if self.is_close_only()
+            && !(aggregate_is_closing_action(
+                slot.position_size,
+                slot.position_size,
+                risk.sum_long_order_size,
+                risk.sum_short_order_size,
+                Some(side),
+            ) || slot.close_only_exempt != 0)
+        {
+            return Err(StateError::CloseOnlyViolation);
         }
 
         Ok(())
@@ -2056,12 +2091,14 @@ impl MarketState {
     }
 
     /// Commits a rest-eligible remainder to the book and its already-entered market slot.
+    /// Batches defer close-only validation until all remainders have been added.
     fn rest_order(
         &mut self,
         subaccount: &mut Subaccount,
         slot_index: usize,
         subaccount_key: Pubkey,
         order: RestingOrder,
+        check_close_only: bool,
     ) -> StateResult<OrderId> {
         // A valid submitted size can leave a remainder below the resting-order minimum.
         self.order_book.validate_order_size(order.size)?;
@@ -2073,7 +2110,6 @@ impl MarketState {
             return Err(StateError::DuplicateOrderAtTick);
         }
 
-        // TODO: Would it make more sense to store it on the struct?
         let market_order_count = subaccount
             .iter_order_refs()
             .iter()
@@ -2099,17 +2135,13 @@ impl MarketState {
             self.order_risk_scale(),
         )?;
 
-        // TODO: It would be better to check this only once when on the close batch path.
-        if self.is_close_only()
-            && !(aggregate_is_closing_action(
-                subaccount.markets[slot_index].position_size,
-                subaccount.markets[slot_index].position_size,
-                next_risk.sum_long_order_size,
-                next_risk.sum_short_order_size,
-                Some(Side::from_size(order.size)?),
-            ) || subaccount.markets[slot_index].close_only_exempt != 0)
-        {
-            return Err(StateError::CloseOnlyViolation);
+        if check_close_only {
+            self.validate_resting_close_only(
+                subaccount,
+                slot_index,
+                Side::from_size(order.size)?,
+                &next_risk,
+            )?;
         }
 
         let order_id = self.order_book.add_order(
@@ -2378,11 +2410,6 @@ impl MarketState {
         }
 
         for order_id in orders {
-            // TODO: Rather than repeatedly multiplying along the cancel_order_ref path, we can instead
-            // choose to just sum up the sizes and update the risk after.
-            // We can probably do that more generally for variants with more than one order to cancel, even in
-            // in the single case as well.
-            // We can also extend the idea to place and modify as well.
             self.close_order(subaccount, *order_id)?;
         }
         Ok(())
