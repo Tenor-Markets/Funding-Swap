@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::instructions::liquidate::{maintenance_health, materialize_entered};
 use crate::instructions::oracle::{
-    market_observation_for, read_observation_set, settlement_ratio, underlying_settlement_price,
+    market_observation_for, read_observation_set, settlement_ratio,
     ObservationSet,
 };
 use crate::state::{
@@ -174,14 +174,9 @@ fn portfolio_settlement_value<'info, const N: usize>(
             }
             market.position_value(slot.position_size, mark, time_to_maturity)?
         };
-        let cross = underlying_settlement_price(&entry.underlying, &observations.settlement)?;
-        let scaled = cross
-            .checked_mul_int(position_value)
-            .map_err(|_| StateError::ArithmeticOverflow)?
-            .floor_atoms()
-            .map_err(|_| StateError::ArithmeticOverflow)?;
+        // The fixed quote already expresses value in settlement units.
         total = total
-            .checked_add(scaled)
+            .checked_add(position_value)
             .ok_or_else(|| error!(StateError::ArithmeticOverflow))?;
     }
     Ok(total)

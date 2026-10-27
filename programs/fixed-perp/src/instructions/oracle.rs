@@ -22,8 +22,8 @@ pub(crate) struct MarketObservation<'info> {
 /// All transient observations for one instruction. The account order is:
 /// collateral AssetState/optional Pyth, settlement AssetState/optional Pyth,
 /// then up to `N` market/underlying AssetState/optional Pyth triples.
-/// One subaccount fits in `MAX_MARKETS`. Deleveraging reads both users, so it
-/// uses `2 * MAX_MARKETS`.
+/// One subaccount fits in `MAX_MARKETS`. Liquidation and deleveraging read both
+/// users, so they use `2 * MAX_MARKETS`.
 pub(crate) struct ObservationSet<'info, const N: usize = MAX_MARKETS> {
     pub(crate) collateral: AssetObservation<'info>,
     pub(crate) settlement: AssetObservation<'info>,

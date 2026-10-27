@@ -65,30 +65,6 @@ pub struct PortfolioMarketObservation<'a> {
     pub underlying: OracleObservation,
 }
 
-impl PortfolioMarketObservation<'_> {
-    /// Matching assets have an exact unit cross-rate. Settlement-to-value
-    /// conversion still applies its conservative price separately.
-    fn conservative_underlying_settlement_price(
-        &self,
-        conservative_settlement_price: FixedPoint,
-        endpoint: PriceEndpoint,
-    ) -> StateResult<FixedPoint> {
-        if self.market.config.underlying_state == self.market.config.settlement_state {
-            return Ok(FixedPoint::from_i64f64(I64F64::ONE));
-        }
-
-        let conservative_underlying_price = self
-            .underlying
-            .conservative_price_for(self.underlying_asset, endpoint)?;
-        let cross_rate = conservative_underlying_price
-            .to_i64f64()
-            .checked_div(conservative_settlement_price.to_i64f64())
-            .ok_or(StateError::ArithmeticOverflow)?;
-
-        Ok(FixedPoint::from_i64f64(cross_rate))
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchOrder {
     pub size: u64,
@@ -3829,23 +3805,11 @@ impl MarginGroup {
             let position_value = market.position_value(slot.position_size, mark, time)?;
             let position_value = market.position_factors.apply(position_value)?;
 
-            // The source observation is an underlying/settlement price.
-            // The fixed-leg value is scaled by that cross-rate exactly once and
-            // then conservatively rounded at the settlement-atom boundary.
+            // Fixed quotes already price the underlying in settlement units.
+            // Apply the conservative settlement price only when valuing that cash.
             let position_endpoint = PriceEndpoint::for_signed_value(position_value);
-
             let conservative_settlement_price = settlement_observation
                 .conservative_price_for(settlement_asset, position_endpoint)?;
-            let cross_rate = observation.conservative_underlying_settlement_price(
-                conservative_settlement_price,
-                position_endpoint,
-            )?;
-            let position_value = cross_rate
-                .checked_mul_int(position_value)
-                .map_err(|_| StateError::ArithmeticOverflow)?
-                .floor_atoms()
-                .map_err(|_| StateError::ArithmeticOverflow)?;
-
             let position_value = self.settlement_factors.apply(position_value)?;
 
             total_value = total_value

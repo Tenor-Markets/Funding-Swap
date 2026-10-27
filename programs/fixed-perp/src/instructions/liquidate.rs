@@ -9,6 +9,9 @@ use crate::state::{
     Subaccount, MAX_MARKETS,
 };
 
+// Both subaccounts may occupy a disjoint set of market slots.
+const MAX_LIQUIDATION_MARKETS: usize = MAX_MARKETS * 2;
+
 #[derive(Accounts)]
 pub struct Liquidate<'info> {
     pub liquidator_authority: Signer<'info>,
@@ -45,7 +48,7 @@ pub fn handle_liquidate<'info>(
 ) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let group = context.accounts.margin_group.load()?;
-    let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
+    let (observations, _) = read_observation_set::<MAX_LIQUIDATION_MARKETS>(
         context.remaining_accounts,
         group.collateral_state,
         group.settlement_state,
