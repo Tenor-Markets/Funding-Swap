@@ -5,8 +5,8 @@ use anchor_lang::prelude::*;
 use crate::instructions::materialize_subaccount::materialize_market;
 use crate::instructions::oracle::{market_observation_for, read_observation_set, ObservationSet};
 use crate::state::{
-    MakerSubaccount, MarginGroup, MarketState, PlaceOrderIntent, PortfolioMarketObservation,
-    StateError, Subaccount, TimeInForce, MAX_MARKETS, MAX_ORDERS,
+    MakerSubaccount, MarginGroup, MarketState, PlaceOrderIntent, StateError, Subaccount,
+    TimeInForce, MAX_MARKETS, MAX_ORDERS,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
@@ -69,14 +69,7 @@ fn check_initial_health<'info>(
     observations: &ObservationSet<'info>,
     now: i64,
 ) -> Result<()> {
-    let collateral_guard = observations.collateral.loader.load()?;
-
-    let settlement_guard = observations.settlement.loader.load()?;
-
     let mut market_guards: [Option<Ref<'_, MarketState>>; MAX_MARKETS] =
-        core::array::from_fn(|_| None);
-
-    let mut underlying_guards: [Option<Ref<'_, crate::state::AssetState>>; MAX_MARKETS] =
         core::array::from_fn(|_| None);
 
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
@@ -84,42 +77,23 @@ fn check_initial_health<'info>(
             let entry = market_observation_for(observations, slot.market_id)?;
 
             market_guards[slot_index] = Some(entry.loader.load()?);
-
-            underlying_guards[slot_index] = Some(entry.underlying.loader.load()?);
         }
     }
 
-    let mut portfolio: [Option<PortfolioMarketObservation<'_>>; MAX_MARKETS] = [None; MAX_MARKETS];
+    let mut portfolio: [Option<&MarketState>; MAX_MARKETS] = [None; MAX_MARKETS];
 
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
         if slot.market_id != 0 {
-            let entry = market_observation_for(observations, slot.market_id)?;
-
             let market = market_guards[slot_index]
                 .as_ref()
                 .ok_or(StateError::MissingMarketObservation)?;
 
-            let underlying_asset = underlying_guards[slot_index]
-                .as_ref()
-                .ok_or(StateError::MissingUnderlyingObservation)?;
-
-            portfolio[slot_index] = Some(PortfolioMarketObservation {
-                market,
-                underlying_asset,
-                underlying: entry.underlying.observation,
-            });
+            portfolio[slot_index] = Some(market);
         }
     }
 
-    let health = group.initial_portfolio_health_with_assets(
-        subaccount,
-        &collateral_guard,
-        observations.collateral.observation,
-        &settlement_guard,
-        observations.settlement.observation,
-        portfolio.iter().flatten().copied(),
-        now,
-    )?;
+    let health =
+        group.initial_portfolio_health(subaccount, portfolio.iter().flatten().copied(), now)?;
 
     if !health.strict_im_met()? {
         return Err(error!(StateError::InsufficientInitialMargin));
@@ -167,12 +141,8 @@ pub fn handle_place_order<'info>(
 
     let group = context.accounts.margin_group.load()?;
 
-    let (observations, maker_account_infos) = read_observation_set::<{crate::state::MAX_MARKETS}>(
-        context.remaining_accounts,
-        group.collateral_state,
-        group.settlement_state,
-        now,
-    )?;
+    let (observations, maker_account_infos) =
+        read_observation_set::<{ crate::state::MAX_MARKETS }>(context.remaining_accounts, now)?;
 
     let (maker_loaders, maker_count) = maker_accounts(maker_account_infos)?;
 
@@ -320,12 +290,8 @@ pub fn handle_modify_order<'info>(
 
     let group = context.accounts.margin_group.load()?;
 
-    let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
-        context.remaining_accounts,
-        group.collateral_state,
-        group.settlement_state,
-        now,
-    )?;
+    let (observations, _) =
+        read_observation_set::<{ crate::state::MAX_MARKETS }>(context.remaining_accounts, now)?;
 
     let mut subaccount = context.accounts.subaccount.load_mut()?;
 

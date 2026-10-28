@@ -2,16 +2,11 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::TokenAccount;
 
 use crate::state::{
-    AssetState, GlobalGovernanceConfig, GovernanceCategory, PriceModel, StateError,
+    AssetState, GlobalGovernanceConfig, GovernanceCategory, OracleConfig, StateError,
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug)]
 pub struct CreateAssetArgs {
-    pub asset_id: u32,
-    pub price_model: u8,
-    pub decimals: u8,
-    pub feed_id: [u8; 32],
-    pub reference_price_raw: i128,
     pub max_age_seconds: u64,
     pub max_confidence_ratio_raw: i128,
     pub max_ema_deviation_raw: i128,
@@ -35,39 +30,35 @@ pub struct CreateAsset<'info> {
         init,
         payer = authority,
         space = AssetState::SPACE,
-        seeds = [b"asset_state", args.asset_id.to_le_bytes().as_ref()],
+        seeds = [crate::state::USDC_SEED],
         bump
     )]
     pub asset: AccountLoader<'info, AssetState>,
-    pub token_account: Option<Account<'info, TokenAccount>>,
+    #[account(
+        constraint = token_account.mint == crate::state::USDC_MINT @ StateError::InvalidTokenAccount,
+        constraint = token_account.owner == asset.key() @ StateError::InvalidTokenAuthority,
+        constraint = token_account.delegate.is_none() @ StateError::InvalidTokenAuthority,
+        constraint = token_account.close_authority.is_none() @ StateError::InvalidTokenAuthority
+    )]
+    pub token_account: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
 }
 
 pub fn handle_create_asset(context: Context<CreateAsset>, args: CreateAssetArgs) -> Result<()> {
-    let token_account = match &context.accounts.token_account {
-        Some(token) => {
-            if token.owner != context.accounts.asset.key() {
-                return Err(error!(StateError::InvalidTokenAuthority));
-            }
-
-            token.key()
-        }
-        None => Pubkey::default(),
-    };
-
     let mut asset = context.accounts.asset.load_init()?;
 
     asset.initialize_in_place(
-        args.asset_id,
         context.bumps.asset,
-        PriceModel(args.price_model),
-        args.decimals,
-        token_account,
-        args.feed_id,
-        crate::state::FixedPoint::from_raw_bits(args.reference_price_raw),
-        args.max_age_seconds,
-        crate::state::FixedPoint::from_raw_bits(args.max_confidence_ratio_raw),
-        crate::state::FixedPoint::from_raw_bits(args.max_ema_deviation_raw),
+        context.accounts.token_account.key(),
+        OracleConfig {
+            feed_id: crate::state::USDC_USD_FEED_ID,
+            max_age_seconds: args.max_age_seconds,
+            _pad: [0; 8],
+            max_confidence_ratio: crate::state::FixedPoint::from_raw_bits(
+                args.max_confidence_ratio_raw,
+            ),
+            max_ema_deviation: crate::state::FixedPoint::from_raw_bits(args.max_ema_deviation_raw),
+        },
         crate::state::FixedPoint::from_raw_bits(args.max_peg_deviation_raw),
         args.window_durations,
         args.short_window_limit_atoms,

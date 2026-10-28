@@ -13,7 +13,6 @@ pub enum MarketAdapterArgs {
         max_abs_native_delta: u128,
         global_configuration: Pubkey,
         perp_asset_map: Pubkey,
-        canonical_quote_mint: Pubkey,
         market_account: Pubkey,
         tick_size: u64,
         funding_interval_seconds: u64,
@@ -29,6 +28,12 @@ pub enum MarketAdapterArgs {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct CreateMarketArgs {
+    pub underlying_decimals: u8,
+    pub underlying_feed_id: [u8; 32],
+    pub underlying_max_age_seconds: u64,
+    pub underlying_max_confidence_ratio_raw: i128,
+    pub underlying_max_ema_deviation_raw: i128,
+
     pub start_timestamp: i64,
     pub maturity_timestamp: i64,
     pub minimum_position_size_atoms: u64,

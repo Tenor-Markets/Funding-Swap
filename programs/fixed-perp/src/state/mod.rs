@@ -13,11 +13,11 @@ pub use market::{
     aggregate_is_closing_action, BatchOrder, ClosingAction, JupiterAdapterPayload, MakerSubaccount,
     MarginGroup, MarginRequirement, MarginRequirementType, MarketConfig, MarketGroupMembership,
     MarketState, MarketStatus, ModifyOrderIntent, PhoenixAdapterPayload, PlaceOrderBatchIntent,
-    PlaceOrderIntent, PlaceOrderResult, PortfolioHealth, PortfolioMarketObservation,
-    VenueAdapterConfig, VenueAdapterKind, VenueLayout, ADAPTER_JUPITER, ADAPTER_PHOENIX,
-    GROUP_ACTIVE, GROUP_PENDING, JUPITER_PAYLOAD_RESERVED, MARGIN_GROUP_RESERVED, MARKET_ACTIVE,
-    MARKET_CLOSE_ONLY, MARKET_CONFIG_RESERVED, MARKET_MATURED, MARKET_PAUSED, MARKET_PENDING,
-    MARKET_STATE_RESERVED, PHOENIX_PAYLOAD_RESERVED, SECONDS_PER_YEAR, VENUE_CONFIG_RESERVED,
+    PlaceOrderIntent, PlaceOrderResult, PortfolioHealth, VenueAdapterConfig, VenueAdapterKind,
+    VenueLayout, ADAPTER_JUPITER, ADAPTER_PHOENIX, GROUP_ACTIVE, GROUP_PENDING,
+    JUPITER_PAYLOAD_RESERVED, MARGIN_GROUP_RESERVED, MARKET_ACTIVE, MARKET_CLOSE_ONLY,
+    MARKET_CONFIG_RESERVED, MARKET_MATURED, MARKET_PAUSED, MARKET_PENDING, MARKET_STATE_RESERVED,
+    PHOENIX_PAYLOAD_RESERVED, SECONDS_PER_YEAR, VENUE_CONFIG_RESERVED,
 };
 pub use order_book::{
     HierarchicalBitmap, OrderBook, OrderId, OrderNode, Side, TickMetadata, TimeInForce,
@@ -28,8 +28,8 @@ pub use user::{
     MarketSlot, OrderRef, OrderRiskAggregate, Subaccount, SubaccountStatus, MARKET_SLOT_RESERVED,
     MAX_MARKETS, MAX_ORDERS, SUBACCOUNT_ACTIVE, SUBACCOUNT_RESERVED,
 };
-pub use valuation::{
-    OracleObservation, PriceEndpoint, PriceModel, SettlementRatio, ValuationFactors,
-    PRICE_MODEL_FIXED, PRICE_MODEL_FLOATING, PRICE_MODEL_PEGGED,
+pub use valuation::{OracleConfig, OracleObservation, ValuationFactors};
+pub use vault::{
+    usdc_asset_address, AssetState, WithdrawalWindow, ASSET_ACTIVE, ASSET_PENDING,
+    ONE_HOUR_SECONDS, PHOENIX_QUOTE_MINT, USDC_DECIMALS, USDC_MINT, USDC_SEED, USDC_USD_FEED_ID,
 };
-pub use vault::{AssetState, WithdrawalWindow, ASSET_ACTIVE, ASSET_PENDING, ONE_HOUR_SECONDS};

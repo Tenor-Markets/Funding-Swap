@@ -16,12 +16,6 @@ pub struct InitializeMarket<'info> {
         constraint = market.to_account_info().data_len() >= MarketState::SPACE @ StateError::InvalidAccountLength
     )]
     pub market: AccountLoader<'info, MarketState>,
-    #[account(constraint = collateral_state.load()?.is_active() @ StateError::InvalidStatus)]
-    pub collateral_state: AccountLoader<'info, AssetState>,
-    #[account(constraint = settlement_state.load()?.is_active() @ StateError::InvalidStatus)]
-    pub settlement_state: AccountLoader<'info, AssetState>,
-    #[account(constraint = underlying_state.load()?.is_active() @ StateError::InvalidStatus)]
-    pub underlying_state: AccountLoader<'info, AssetState>,
 }
 
 pub fn handle_initialize_market(
@@ -66,7 +60,6 @@ pub fn handle_initialize_market(
             max_abs_native_delta,
             global_configuration,
             perp_asset_map,
-            canonical_quote_mint,
             market_account,
             tick_size,
             funding_interval_seconds,
@@ -84,7 +77,6 @@ pub fn handle_initialize_market(
                 max_abs_native_delta,
                 global_configuration,
                 perp_asset_map,
-                canonical_quote_mint,
                 market_account,
                 tick_size,
                 funding_interval_seconds,
@@ -109,9 +101,15 @@ pub fn handle_initialize_market(
         args.maturity_timestamp,
         args.minimum_position_size_atoms,
         args.maximum_position_size_atoms,
-        context.accounts.collateral_state.key(),
-        context.accounts.settlement_state.key(),
-        context.accounts.underlying_state.key(),
+        OracleConfig {
+            feed_id: args.underlying_feed_id,
+            max_age_seconds: args.underlying_max_age_seconds,
+            _pad: [0; 8],
+            max_confidence_ratio: FixedPoint::from_raw_bits(
+                args.underlying_max_confidence_ratio_raw,
+            ),
+            max_ema_deviation: FixedPoint::from_raw_bits(args.underlying_max_ema_deviation_raw),
+        },
         adapter,
         FixedPoint::from_raw_bits(args.rate_floor_raw),
         FixedPoint::from_raw_bits(args.initial_margin_factor_raw),
@@ -128,8 +126,7 @@ pub fn handle_initialize_market(
         args.mark_observation_window_seconds,
         args.margin_time_threshold_seconds,
         args.tick_scale,
-        context.accounts.underlying_state.load()?.decimals,
-        context.accounts.settlement_state.load()?.decimals,
+        args.underlying_decimals,
     )?;
 
     let mut market = context.accounts.market.load_init()?;

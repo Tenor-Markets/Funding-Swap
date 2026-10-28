@@ -11,11 +11,13 @@ pub struct CollectProtocolFees<'info> {
     )]
     pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
     #[account(
+        seeds = [crate::state::USDC_SEED], bump = asset.load()?.bump,
         mut,
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
         constraint = asset.load()?.is_valid_custody(token_vault.key()) @ StateError::InvalidTargetCustody
     )]
     pub asset: AccountLoader<'info, AssetState>,
+    #[account(address = crate::state::USDC_MINT)]
     pub mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -35,7 +37,6 @@ pub fn handle_collect_protocol_fees<'info>(
     context: Context<'info, CollectProtocolFees<'info>>,
 ) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
-    let asset_state = context.accounts.asset.key();
 
     if context.remaining_accounts.len() > 0 {
 
@@ -50,10 +51,6 @@ pub fn handle_collect_protocol_fees<'info>(
         for loader in &loaders {
             let market = loader.load_mut()?;
 
-            if !market.config.is_same_collateral_state(asset_state) {
-                return Err(StateError::MarketAssetMismatch.into());
-            }
-
             markets.push(market);
         }
 
@@ -67,16 +64,15 @@ pub fn handle_collect_protocol_fees<'info>(
         drop(markets);
         drop(loaders);
 
-        let (asset_id, bump) = {
+        let bump = {
             let mut asset = context.accounts.asset.load_mut()?;
 
             asset.check_and_commit_withdrawal(u128::from(amount), now)?;
 
-            (asset.asset_id, asset.bump)
+            asset.bump
         };
 
-        let asset_id_bytes = asset_id.to_le_bytes();
-        let signer_seeds: &[&[u8]] = &[b"asset_state", asset_id_bytes.as_ref(), &[bump]];
+        let signer_seeds: &[&[u8]] = &[crate::state::USDC_SEED, &[bump]];
 
         token::transfer_checked(
             CpiContext::new_with_signer(

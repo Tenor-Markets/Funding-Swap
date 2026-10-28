@@ -1,9 +1,6 @@
-use anchor_lang::prelude::*;
-
-use crate::instructions::oracle::{
-    read_asset_observation, settlement_ratio, underlying_settlement_price,
-};
+use crate::instructions::refresh_market::read_fee_price;
 use crate::state::{MarketState, StateError, MARKET_ACTIVE, MARKET_CLOSE_ONLY};
+use anchor_lang::prelude::*;
 
 #[derive(Accounts)]
 pub struct FinalizeMarket<'info> {
@@ -14,102 +11,54 @@ pub struct FinalizeMarket<'info> {
 #[derive(Accounts)]
 pub struct FinalizeMarkets {}
 
-pub fn handle_finalize_market<'info>(context: Context<'info, FinalizeMarket<'info>>) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
+fn finalize_one_market<'info>(
+    loader: &AccountLoader<'info, MarketState>,
+    accounts: &'info [AccountInfo<'info>],
+    now: i64,
+) -> Result<usize> {
+    let market = loader.load()?;
 
-    finalize_one_market(&context.accounts.market, context.remaining_accounts, now)
-}
-
-fn ensure_finalization_ready(market: &MarketState, now: i64) -> Result<()> {
     if now < market.config.maturity_timestamp {
-        return Err(error!(StateError::MaturityNotReached));
+        return Err(StateError::MaturityNotReached.into());
     }
 
     if !matches!(market.status.0, MARKET_ACTIVE | MARKET_CLOSE_ONLY) {
-        return Err(error!(StateError::InvalidStatus));
+        return Err(StateError::InvalidStatus.into());
+    }
+
+    let (consumed, price) = read_fee_price(&market, accounts, now)?;
+
+    drop(market);
+    let mut market = loader.load_mut()?;
+    let maturity = market.config.maturity_timestamp;
+    market.advance_fee_index_with_price(maturity, price)?;
+    market.finalize(now)?;
+    Ok(consumed)
+}
+
+pub fn handle_finalize_market<'info>(context: Context<'info, FinalizeMarket<'info>>) -> Result<()> {
+    let consumed = finalize_one_market(
+        &context.accounts.market,
+        context.remaining_accounts,
+        Clock::get()?.unix_timestamp,
+    )?;
+
+    if consumed != context.remaining_accounts.len() {
+        return Err(StateError::InvalidRemainingAccounts.into());
     }
 
     Ok(())
 }
 
-fn finalize_one_market<'info>(
-    market_loader: &AccountLoader<'info, MarketState>,
-    remaining_accounts: &'info [AccountInfo<'info>],
-    now: i64,
-) -> Result<()> {
-    let (collateral_key, settlement_key, underlying_key) = {
-        let market_view = market_loader.load()?;
-
-        ensure_finalization_ready(&market_view, now)?;
-
-        (
-            market_view.config.collateral_state,
-            market_view.config.settlement_state,
-            market_view.config.underlying_state,
-        )
-    };
-
-    let (underlying_asset, remaining) =
-        read_asset_observation(remaining_accounts, underlying_key, now)?;
-
-    let (collateral_asset, remaining) = read_asset_observation(remaining, collateral_key, now)?;
-
-    let (settlement_asset, _) = read_asset_observation(remaining, settlement_key, now)?;
-
-    let ratio = settlement_ratio(&collateral_asset, &settlement_asset)?;
-
-    let index_price = underlying_settlement_price(&underlying_asset, &settlement_asset)?;
-
-    let mut market = market_loader.load_mut()?;
-    let maturity = market.config.maturity_timestamp;
-
-    market.advance_fee_index_with_price(maturity, index_price)?;
-    market.freeze_settlement_ratio(ratio, now)?;
-
-    Ok(())
-}
-
-/// Batched form used by keepers. Each market is followed immediately by its
-/// underlying, collateral, and settlement AssetState/oracle pairs.
+/// Each market is followed by USDC custody, its Pyth update, and (for Phoenix) an underlying update.
 pub fn handle_finalize_markets<'info>(context: Context<'info, FinalizeMarkets>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let mut remaining = context.remaining_accounts;
-
-    while let Some(market_info) = remaining.first() {
-        let loader = AccountLoader::<MarketState>::try_from(market_info)?;
-
+    while let Some(info) = remaining.first() {
+        let loader = AccountLoader::<MarketState>::try_from(info)?;
         remaining = &remaining[1..];
-
-        let (collateral_key, settlement_key, underlying_key) = {
-            let market = loader.load()?;
-
-            ensure_finalization_ready(&market, now)?;
-
-            (
-                market.config.collateral_state,
-                market.config.settlement_state,
-                market.config.underlying_state,
-            )
-        };
-
-        let (underlying, remaining_after_underlying) =
-            read_asset_observation(remaining, underlying_key, now)?;
-        let (collateral, remaining_after_collateral) =
-            read_asset_observation(remaining_after_underlying, collateral_key, now)?;
-        let (settlement, rest) =
-            read_asset_observation(remaining_after_collateral, settlement_key, now)?;
-
-        remaining = rest;
-
-        let ratio = settlement_ratio(&collateral, &settlement)?;
-        let index_price = underlying_settlement_price(&underlying, &settlement)?;
-
-        let mut market = loader.load_mut()?;
-        let maturity = market.config.maturity_timestamp;
-
-        market.advance_fee_index_with_price(maturity, index_price)?;
-        market.freeze_settlement_ratio(ratio, now)?;
+        let consumed = finalize_one_market(&loader, remaining, now)?;
+        remaining = &remaining[consumed..];
     }
-
     Ok(())
 }

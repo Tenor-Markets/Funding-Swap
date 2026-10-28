@@ -5,8 +5,7 @@ use anchor_lang::prelude::*;
 use crate::instructions::materialize_subaccount::materialize_market;
 use crate::instructions::oracle::{market_observation_for, read_observation_set, ObservationSet};
 use crate::state::{
-    AssetState, MarginGroup, MarketState, PortfolioHealth, PortfolioMarketObservation, StateError,
-    Subaccount, MAX_MARKETS,
+    MarginGroup, MarketState, PortfolioHealth, StateError, Subaccount, MAX_MARKETS,
 };
 
 // Both subaccounts may occupy a disjoint set of market slots.
@@ -48,17 +47,9 @@ pub fn handle_liquidate<'info>(
 ) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let group = context.accounts.margin_group.load()?;
-    let (observations, _) = read_observation_set::<MAX_LIQUIDATION_MARKETS>(
-        context.remaining_accounts,
-        group.collateral_state,
-        group.settlement_state,
-        now,
-    )?;
+    let (observations, _) =
+        read_observation_set::<MAX_LIQUIDATION_MARKETS>(context.remaining_accounts, now)?;
     let entry = market_observation_for(&observations, market_id)?;
-    {
-        let market = entry.loader.load()?;
-        group.ensure_market_assets_match(&market)?;
-    }
 
     {
         let mut victim = context.accounts.victim.load_mut()?;
@@ -170,11 +161,7 @@ fn portfolio_health<'info, const N: usize>(
     now: i64,
     maintenance: bool,
 ) -> Result<PortfolioHealth> {
-    let collateral_guard = observations.collateral.loader.load()?;
-    let settlement_guard = observations.settlement.loader.load()?;
     let mut market_guards: [Option<Ref<'_, MarketState>>; MAX_MARKETS] =
-        core::array::from_fn(|_| None);
-    let mut underlying_guards: [Option<Ref<'_, AssetState>>; MAX_MARKETS] =
         core::array::from_fn(|_| None);
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
         if slot.market_id == 0 {
@@ -182,44 +169,22 @@ fn portfolio_health<'info, const N: usize>(
         }
         let entry = market_observation_for(observations, slot.market_id)?;
         market_guards[slot_index] = Some(entry.loader.load()?);
-        underlying_guards[slot_index] = Some(entry.underlying.loader.load()?);
     }
-    let mut portfolio: [Option<PortfolioMarketObservation<'_>>; MAX_MARKETS] = [None; MAX_MARKETS];
+    let mut portfolio: [Option<&MarketState>; MAX_MARKETS] = [None; MAX_MARKETS];
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
         if slot.market_id == 0 {
             continue;
         }
-        let entry = market_observation_for(observations, slot.market_id)?;
-        portfolio[slot_index] = Some(PortfolioMarketObservation {
-            market: market_guards[slot_index]
+        portfolio[slot_index] = Some(
+            market_guards[slot_index]
                 .as_ref()
                 .ok_or(StateError::MissingMarketObservation)?,
-            underlying_asset: underlying_guards[slot_index]
-                .as_ref()
-                .ok_or(StateError::MissingUnderlyingObservation)?,
-            underlying: entry.underlying.observation,
-        });
+        );
     }
     let markets = portfolio.iter().flatten().copied();
     if maintenance {
-        Ok(group.maintenance_portfolio_health_with_assets(
-            subaccount,
-            &collateral_guard,
-            observations.collateral.observation,
-            &settlement_guard,
-            observations.settlement.observation,
-            markets,
-            now,
-        )?)
+        Ok(group.maintenance_portfolio_health(subaccount, markets, now)?)
     } else {
-        Ok(group.initial_portfolio_health_with_assets(
-            subaccount,
-            &collateral_guard,
-            observations.collateral.observation,
-            &settlement_guard,
-            observations.settlement.observation,
-            markets,
-            now,
-        )?)
+        Ok(group.initial_portfolio_health(subaccount, markets, now)?)
     }
 }

@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 
 #[error_code]
 #[derive(Eq, PartialEq)]
+// Explicit discriminants preserve published error numbers after obsolete variants are removed.
 pub enum FixedPerpError {
     #[msg("Arithmetic overflow, underflow, or an out-of-range numeric conversion.")]
     ArithmeticOverflow,
@@ -222,12 +223,9 @@ pub enum FixedPerpError {
     OrderSideChangeNotAllowed,
     #[msg("The minimum tick cannot exceed the maximum tick.")]
     InvalidTickRange,
-    #[msg(
-        "Settlement conversion requires positive prices and a nonzero numerator and denominator."
-    )]
-    InvalidSettlementRatio,
+
     #[msg("The normalized oracle price, EMA, confidence or confidence bounds are invalid.")]
-    InvalidOracleObservation,
+    InvalidOracleObservation = 110,
     #[msg(
         "Oracle prices must be nonnegative before scaling and positive when used for conversion."
     )]
@@ -272,14 +270,9 @@ pub enum FixedPerpError {
     InvalidWithdrawalWindowDurations,
     #[msg("Oracle confidence, EMA-deviation and peg-deviation limits must be nonnegative.")]
     InvalidOraclePolicy,
-    #[msg("A fixed asset must have a unit reference price, no custody or feed, and zero confidence and EMA-deviation limits.")]
-    InvalidFixedAssetConfiguration,
-    #[msg("A pegged asset requires a feed, a positive reference price and maximum age, and peg deviation below one.")]
-    InvalidPeggedAssetConfiguration,
-    #[msg("A floating asset requires a feed and positive maximum age, with zero reference price and peg deviation.")]
-    InvalidFloatingAssetConfiguration,
+
     #[msg("Every governance authority must be a nonzero public key.")]
-    InvalidGovernanceAuthority,
+    InvalidGovernanceAuthority = 133,
     #[msg("The creation-fee destination must match the configured nonzero public key.")]
     InvalidCreationFeeDestination,
     #[msg("Authority rotation requires both a category and its replacement authority.")]
@@ -290,10 +283,9 @@ pub enum FixedPerpError {
     MarketNotMatured,
     #[msg("This operation must occur before the market maturity timestamp.")]
     MarketExpired,
-    #[msg("The matured market is missing its frozen settlement conversion ratio.")]
-    MissingSettlementRatio,
+
     #[msg("The market funding source must be seeded before this operation.")]
-    MarketSourceNotSeeded,
+    MarketSourceNotSeeded = 140,
     #[msg("Liquidation health ratio must be at least zero and strictly below one.")]
     InvalidLiquidationHealthRatio,
     #[msg("A required market account was not supplied.")]
@@ -326,10 +318,9 @@ pub enum FixedPerpError {
     TooManyMakerAccounts,
     #[msg("The order time-in-force value is not supported.")]
     InvalidTimeInForce,
-    #[msg("The asset price model must be fixed, pegged or floating.")]
-    InvalidPriceModel,
+
     #[msg("The requested governance authority category does not exist.")]
-    InvalidGovernanceCategory,
+    InvalidGovernanceCategory = 158,
     #[msg("The market funding adapter kind is not supported.")]
     InvalidAdapterKind,
     #[msg("The requested venue payload does not match the market adapter kind.")]
@@ -338,4 +329,6 @@ pub enum FixedPerpError {
     DelegateIsOwner,
     #[msg("The custody token account must be controlled by the asset-state account.")]
     InvalidTokenAuthority,
+    #[msg("The authenticated USDC price is outside the permitted peg band.")]
+    UsdcOutsidePegBand,
 }

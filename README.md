@@ -6,11 +6,13 @@ The workspace is intentionally narrow:
 
 - `crates/fixed-perp-math` holds the checked fixed-point primitives.
 - `programs/fixed-perp` holds the production Anchor program scaffold.
-- `guide/guide.md` is reconciled with the implementation; its `DONT TOUCH`
-  suffix remains byte-for-byte protected.
+- [USDC accounting](guide/usdc-accounting.md) specifies the current currency, oracle,
+  custody, and settlement interfaces.
+- `guide/guide.md` contains the broader protocol design; its `DONT TOUCH` suffix
+  remains byte-for-byte protected.
 
 Governance uses [eight direct authorities](guide/governance.md), with approval
-and timelocks delegated to Squads. The governance refactor changes account
+and timelocks delegated to Squads. The governance and USDC refactors change account
 layouts and instruction interfaces; existing accounts need a separate migration
 or fresh deployment.
 

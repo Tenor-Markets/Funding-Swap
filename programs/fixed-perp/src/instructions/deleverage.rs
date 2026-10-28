@@ -1,10 +1,7 @@
 use anchor_lang::prelude::*;
 
 use crate::instructions::liquidate::{maintenance_health, materialize_entered};
-use crate::instructions::oracle::{
-    market_observation_for, read_observation_set, settlement_ratio,
-    ObservationSet,
-};
+use crate::instructions::oracle::{market_observation_for, read_observation_set, ObservationSet};
 use crate::state::{
     FixedPoint, GlobalGovernanceConfig, GovernanceCategory, MarginGroup, StateError, Subaccount,
     MAX_MARKETS,
@@ -55,12 +52,8 @@ pub fn handle_deleverage<'info>(
     let now = Clock::get()?.unix_timestamp;
     let group = context.accounts.margin_group.load()?;
     // Both users can hold a full, disjoint set of markets.
-    let (observations, _) = read_observation_set::<{ MAX_MARKETS * 2 }>(
-        context.remaining_accounts,
-        group.collateral_state,
-        group.settlement_state,
-        now,
-    )?;
+    let (observations, _) =
+        read_observation_set::<{ MAX_MARKETS * 2 }>(context.remaining_accounts, now)?;
     drop(group);
     execute_deleverage(
         context.accounts,
@@ -84,10 +77,6 @@ fn execute_deleverage<'info>(
 ) -> Result<()> {
     let group = accounts.margin_group.load()?;
     let entry = market_observation_for(observations, market_id)?;
-    {
-        let market = entry.loader.load()?;
-        group.ensure_market_assets_match(&market)?;
-    }
 
     {
         let mut winner = accounts.winner.load_mut()?;
@@ -148,8 +137,7 @@ fn portfolio_settlement_value<'info, const N: usize>(
     observations: &ObservationSet<'info, N>,
     now: i64,
 ) -> Result<i128> {
-    let ratio = settlement_ratio(&observations.collateral, &observations.settlement)?;
-    let mut total = ratio.apply_inverse(subaccount.collateral_balance_atoms)?;
+    let mut total = subaccount.collateral_balance_atoms;
     for slot in &subaccount.markets {
         if slot.market_id == 0 {
             continue;
@@ -169,9 +157,6 @@ fn portfolio_settlement_value<'info, const N: usize>(
                 return Err(error!(StateError::InvalidClock));
             }
             let mark = market.current_mark_rate(now)?;
-            if market.config.settlement_state != observations.settlement.loader.key() {
-                return Err(error!(StateError::MarketAssetMismatch));
-            }
             market.position_value(slot.position_size, mark, time_to_maturity)?
         };
         // The fixed quote already expresses value in settlement units.

@@ -10,7 +10,8 @@ pub struct ActivateAsset<'info> {
     )]
     pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
     #[account(
-        mut, 
+        seeds = [crate::state::USDC_SEED], bump = asset.load()?.bump,
+        mut,
         constraint = asset.load()?.is_pending() @ StateError::InvalidStatus
     )]
     pub asset: AccountLoader<'info, AssetState>,

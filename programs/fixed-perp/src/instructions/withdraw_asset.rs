@@ -6,10 +6,7 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
 use crate::instructions::close_empty_markets::slot_is_empty;
 use crate::instructions::materialize_subaccount::materialize_market;
 use crate::instructions::oracle::{market_observation_for, read_observation_set, ObservationSet};
-use crate::state::{
-    AssetState, MarginGroup, MarketState, PortfolioMarketObservation, StateError, Subaccount,
-    MAX_MARKETS,
-};
+use crate::state::{AssetState, MarginGroup, MarketState, StateError, Subaccount, MAX_MARKETS};
 
 #[derive(Accounts)]
 pub struct WithdrawAsset<'info> {
@@ -23,15 +20,16 @@ pub struct WithdrawAsset<'info> {
     #[account(
         mut,
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidAccountKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
     #[account(
+        seeds = [crate::state::USDC_SEED], bump = asset.load()?.bump,
         mut,
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
         constraint = asset.load()?.is_valid_custody(token_account.key()) @ StateError::InvalidTargetCustody
     )]
     pub asset: AccountLoader<'info, AssetState>,
+    #[account(address = crate::state::USDC_MINT)]
     pub mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -90,13 +88,7 @@ fn validate_withdraw_health<'info>(
     let mut market_guards: [Option<Ref<'_, MarketState>>; MAX_MARKETS] =
         core::array::from_fn(|_| None);
 
-    let mut underlying_guards: [Option<Ref<'_, AssetState>>; MAX_MARKETS] =
-        core::array::from_fn(|_| None);
-
-    let collateral_guard = observations.collateral.loader.load()?;
-    let settlement_guard = observations.settlement.loader.load()?;
-
-    let mut portfolio: [Option<PortfolioMarketObservation<'_>>; MAX_MARKETS] = [None; MAX_MARKETS];
+    let mut portfolio: [Option<&MarketState>; MAX_MARKETS] = [None; MAX_MARKETS];
 
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
         if slot.market_id == 0 {
@@ -106,8 +98,6 @@ fn validate_withdraw_health<'info>(
         let entry = market_observation_for(observations, slot.market_id)?;
 
         market_guards[slot_index] = Some(entry.loader.load()?);
-
-        underlying_guards[slot_index] = Some(entry.underlying.loader.load()?);
     }
 
     for (slot_index, slot) in subaccount.markets.iter().enumerate() {
@@ -115,21 +105,11 @@ fn validate_withdraw_health<'info>(
             continue;
         }
 
-        let entry = market_observation_for(observations, slot.market_id)?;
-
         let market = market_guards[slot_index]
             .as_ref()
             .ok_or(StateError::MissingMarketObservation)?;
 
-        let underlying_asset = underlying_guards[slot_index]
-            .as_ref()
-            .ok_or(StateError::MissingUnderlyingObservation)?;
-
-        portfolio[slot_index] = Some(PortfolioMarketObservation {
-            market,
-            underlying_asset,
-            underlying: entry.underlying.observation,
-        });
+        portfolio[slot_index] = Some(market);
     }
 
     let amount_i128 = i128::from(amount);
@@ -139,15 +119,8 @@ fn validate_withdraw_health<'info>(
         .checked_sub(amount_i128)
         .ok_or_else(|| error!(StateError::ArithmeticOverflow))?;
 
-    let health = group.initial_portfolio_health_with_assets(
-        subaccount,
-        &collateral_guard,
-        observations.collateral.observation,
-        &settlement_guard,
-        observations.settlement.observation,
-        portfolio.iter().flatten().copied(),
-        now,
-    )?;
+    let health =
+        group.initial_portfolio_health(subaccount, portfolio.iter().flatten().copied(), now)?;
 
     if !health.strict_im_met()? {
         return Err(error!(StateError::InsufficientInitialMargin));
@@ -163,19 +136,14 @@ pub fn handle_withdraw_asset<'info>(
     if amount != 0 {
         let now = Clock::get()?.unix_timestamp;
 
-        let (asset_id, bump) = {
-            let asset = context.accounts.asset.load()?;
-            (asset.asset_id, asset.bump)
-        };
+        let bump = context.accounts.asset.load()?.bump;
 
         {
             let group = context.accounts.margin_group.load()?;
             let mut subaccount = context.accounts.subaccount.load_mut()?;
 
-            let (observations, _) = read_observation_set::<{crate::state::MAX_MARKETS}>(
+            let (observations, _) = read_observation_set::<{ crate::state::MAX_MARKETS }>(
                 context.remaining_accounts,
-                group.collateral_state,
-                group.settlement_state,
                 now,
             )?;
 
@@ -189,8 +157,7 @@ pub fn handle_withdraw_asset<'info>(
             .load_mut()?
             .check_and_commit_withdrawal(u128::from(amount), now)?;
 
-        let asset_id_bytes = asset_id.to_le_bytes();
-        let signer_seeds: &[&[u8]] = &[b"asset_state", asset_id_bytes.as_ref(), &[bump]];
+        let signer_seeds: &[&[u8]] = &[crate::state::USDC_SEED, &[bump]];
 
         token::transfer_checked(
             CpiContext::new_with_signer(

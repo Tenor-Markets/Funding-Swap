@@ -46,7 +46,6 @@ pub fn handle_activate_market_group_membership(
         return Err(StateError::InvalidStatus.into());
     }
 
-    group.ensure_market_assets_match(&market)?;
     group.add_market()?;
 
     Ok(())

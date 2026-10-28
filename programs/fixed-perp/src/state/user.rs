@@ -39,7 +39,6 @@ pub struct OrderRiskAggregate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OrderRiskScale {
     pub(crate) underlying_decimals: u8,
-    pub(crate) settlement_decimals: u8,
     pub(crate) tick_scale: u8,
 }
 
@@ -228,7 +227,6 @@ impl Subaccount {
         &mut self,
         market_slot_index: usize,
         market: &MarketState,
-        ratio: super::SettlementRatio,
     ) -> StateResult<()> {
         let slot = self
             .markets
@@ -243,7 +241,7 @@ impl Subaccount {
             return Ok(());
         }
 
-        let collateral = ratio.apply(slot.settlement_balance_atoms)?;
+        let collateral = slot.settlement_balance_atoms;
 
         self.collateral_balance_atoms = self
             .collateral_balance_atoms
@@ -255,22 +253,14 @@ impl Subaccount {
         Ok(())
     }
 
-    /// Converts a finalized market's signed settlement balance into this
-    /// subaccount's signed collateral balance, then releases the slot.  The
-    /// market ratio is applied exactly once; a missing ratio keeps the slot
-    /// open so callers cannot close around an unsettled obligation.  A
-    /// non-zero position is the expired contract itself and is retired here
-    /// after all pending orders have already been cancelled by the caller.
-    /// The caller must establish that the market is matured.
+    /// Moves a finalized market's USDC cash into collateral and releases the slot.
+    /// The caller establishes maturity and cancels/materializes all orders first.
+    /// The expired position is retired from open interest without another cash flow.
     pub fn settle_and_close_market(
         &mut self,
         market_slot_index: usize,
         market: &mut MarketState,
     ) -> StateResult<()> {
-        let ratio = market
-            .frozen_settlement_ratio()
-            .ok_or(StateError::MissingSettlementRatio)?;
-
         let slot = self
             .markets
             .get(market_slot_index)
@@ -297,7 +287,7 @@ impl Subaccount {
 
         // Settlement is idempotent once the balance is zero, so a later close
         // failure can be retried without subtracting open interest twice.
-        self.settle_market_into_collateral(market_slot_index, market, ratio)?;
+        self.settle_market_into_collateral(market_slot_index, market)?;
 
         market.materialized_gross_open_interest = next_open_interest;
 
@@ -373,7 +363,7 @@ impl OrderRiskAggregate {
 
         let effective_rate = fixed::types::I64F64::from_bits(effective_raw);
 
-        let settlement_scale = scale(unit_scale.settlement_decimals)?;
+        let settlement_scale = scale(super::USDC_DECIMALS)?;
 
         let underlying_scale = scale(unit_scale.underlying_decimals)?;
 

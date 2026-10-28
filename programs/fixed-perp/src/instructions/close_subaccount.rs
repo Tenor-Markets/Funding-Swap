@@ -19,13 +19,14 @@ pub struct CloseSubaccount<'info> {
     #[account(
         mut,
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidAccountKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
     #[account(
+        seeds = [crate::state::USDC_SEED], bump = asset.load()?.bump,
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus
     )]
     pub asset: AccountLoader<'info, AssetState>,
+    #[account(address = crate::state::USDC_MINT)]
     pub mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -131,14 +132,14 @@ pub fn handle_close_subaccount<'info>(
             .map_err(|_| StateError::ArithmeticOverflow)?
     };
 
-    let (asset_id, bump) = {
+    let bump = {
         let asset = context.accounts.asset.load()?;
 
         if !asset.is_valid_custody(context.accounts.token_account.key()) {
             return Err(StateError::InvalidTargetCustody.into());
         }
 
-        (asset.asset_id, asset.bump)
+        asset.bump
     };
 
     context
@@ -147,8 +148,7 @@ pub fn handle_close_subaccount<'info>(
         .load_mut()?
         .check_and_commit_withdrawal(u128::from(remaining_collateral), now)?;
 
-    let asset_id_bytes = asset_id.to_le_bytes();
-    let signer_seeds: &[&[u8]] = &[b"asset_state", asset_id_bytes.as_ref(), &[bump]];
+    let signer_seeds: &[&[u8]] = &[crate::state::USDC_SEED, &[bump]];
 
     token::transfer_checked(
         CpiContext::new_with_signer(

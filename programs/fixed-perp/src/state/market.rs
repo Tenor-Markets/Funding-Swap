@@ -1,6 +1,3 @@
-use std::cmp::Ordering;
-use std::ops::SubAssign;
-
 use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use fixed::types::I64F64;
@@ -8,9 +5,8 @@ use fixed_perp_math::{rate::RateDelta, Rate};
 
 use super::user::OrderRiskScale;
 use super::{
-    AssetState, FixedPoint, OracleObservation, OrderBook, OrderId, OrderRef, PriceEndpoint,
-    SettlementRatio, Side, StateError, StateResult, Subaccount, TimeInForce, ValuationFactors,
-    BOOK_CAPACITY, FREE_INDEX,
+    FixedPoint, OracleConfig, OrderBook, OrderId, OrderRef, Side, StateError, StateResult,
+    Subaccount, TimeInForce, ValuationFactors, BOOK_CAPACITY, FREE_INDEX,
 };
 
 pub use fixed_perp_math::rate::SECONDS_PER_YEAR;
@@ -54,15 +50,6 @@ pub struct PlaceOrderResult {
     pub fixed_payment_atoms: i128,
     pub taker_fee_atoms: u128,
     pub resting_order: Option<OrderId>,
-}
-
-/// One market plus the transient authenticated observation for its underlying
-/// AssetState.  The observation is caller-owned and never persisted.
-#[derive(Clone, Copy)]
-pub struct PortfolioMarketObservation<'a> {
-    pub market: &'a MarketState,
-    pub underlying_asset: &'a AssetState,
-    pub underlying: OracleObservation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,15 +168,10 @@ pub struct MarginGroup {
     pub bump: u8,
     pub status: u8,
     pub _pad_0: [u8; 4],
-    pub collateral_state: Pubkey,
-    pub settlement_state: Pubkey,
     pub critical_health_ratio: FixedPoint,
     pub risky_order_cancellation_ratio: FixedPoint,
     pub market_count: u32,
     pub subaccount_count: u32,
-    /// Group-level health haircuts.
-    pub collateral_factors: ValuationFactors,
-    pub settlement_factors: ValuationFactors,
     pub reserved: [u8; MARGIN_GROUP_RESERVED],
 }
 
@@ -200,10 +182,6 @@ impl MarginGroup {
 
     pub fn is_active(&self) -> bool {
         self.status == GROUP_ACTIVE
-    }
-
-    pub fn is_same_collateral_state(&self, state: Pubkey) -> bool {
-        self.collateral_state == state
     }
 
     /// Records one newly created subaccount after the instruction validates its group binding.
@@ -271,7 +249,6 @@ pub struct PhoenixAdapterPayload {
     pub max_abs_native_delta: u128,
     pub global_configuration: Pubkey,
     pub perp_asset_map: Pubkey,
-    pub canonical_quote_mint: Pubkey,
     pub market_account: Pubkey,
     pub tick_size: u64,
     pub funding_interval_seconds: u64,
@@ -309,10 +286,7 @@ pub struct MarketConfig {
     /// Minimum and maximum position sizes in underlying atoms.
     pub minimum_position_size_atoms: u64,
     pub maximum_position_size_atoms: u64,
-    pub collateral_state: Pubkey,
-    pub settlement_state: Pubkey,
-    pub underlying_state: Pubkey,
-    pub _pad_0: [u8; 16],
+    pub underlying_oracle: OracleConfig,
     pub adapter: VenueAdapterConfig,
     pub rate_floor: FixedPoint,
     pub initial_margin_factor: FixedPoint,
@@ -331,11 +305,9 @@ pub struct MarketConfig {
     pub pm_cache_nonce: u32,
     /// Implicit decimal exponent for all market rate/index mantissas.
     pub tick_scale: u8,
-    /// AssetState decimal metadata for position/order/OI underlying atoms.
+    /// Decimal metadata for position/order/OI underlying atoms.
     pub underlying_decimals: u8,
-    /// AssetState decimal metadata for settlement balances and payments.
-    pub settlement_decimals: u8,
-    pub _pad_units: u8,
+    pub _pad_units: [u8; 2],
     pub reserved: [u8; MARKET_CONFIG_RESERVED],
     pub _pad_2: [u8; 12],
     pub _pad_3: [u8; 12],
@@ -366,36 +338,18 @@ pub struct MarketState {
     pub source_seeded: u8,
     pub _pad_0: [u8; 2],
     pub subaccount_count: u32,
-    pub _pad_settlement_ratio: MarketAlignmentPadding,
-    /// Authenticated collateral-per-settlement ratio frozen at maturity.
-    pub frozen_settlement_ratio: SettlementRatio,
-    /// Timestamp at which the settlement ratio was frozen.
+    /// Timestamp at which maturity finalization completed.
     pub finalized_at_timestamp: i64,
+    pub _pad_tail: [u8; 8],
     pub reserved: [u8; MARKET_STATE_RESERVED],
 }
 
 impl MarketState {
-    /// Reads the authenticated collateral-per-settlement ratio frozen at
-    /// maturity.
-    pub fn frozen_settlement_ratio(&self) -> Option<SettlementRatio> {
-        let ratio = self.frozen_settlement_ratio;
-
-        (ratio.numerator != 0 && ratio.denominator != 0).then_some(ratio)
-    }
-
     pub fn finalized_at(&self) -> Option<i64> {
         (self.finalized_at_timestamp > 0).then_some(self.finalized_at_timestamp)
     }
 
-    pub fn freeze_settlement_ratio(
-        &mut self,
-        ratio: SettlementRatio,
-        finalized_at: i64,
-    ) -> StateResult<()> {
-        if ratio.numerator == 0 || ratio.denominator == 0 {
-            return Err(StateError::InvalidSettlementRatio);
-        }
-
+    pub fn finalize(&mut self, finalized_at: i64) -> StateResult<()> {
         if !matches!(self.status.0, MARKET_ACTIVE | MARKET_CLOSE_ONLY) {
             return Err(StateError::InvalidStatus);
         }
@@ -408,7 +362,6 @@ impl MarketState {
             return Err(StateError::MaturityNotReached);
         }
 
-        self.frozen_settlement_ratio = ratio;
         self.finalized_at_timestamp = finalized_at;
         self.status = MarketStatus(MARKET_MATURED);
 
@@ -467,12 +420,7 @@ impl MarketState {
         self.status.0 == MARKET_MATURED
     }
 
-    /// Collateral atoms the protocol may remove for this market's booked fees.
-    ///
-    /// Every slot must already be closed, so its settlement has been folded
-    /// into collateral claims and this fee was not credited to a user. A
-    /// matured market converts the fee at the same frozen ratio, floored.
-    /// The same asset is already denominated in collateral atoms.
+    /// USDC fees become withdrawable only after maturity and every slot has closed.
     pub fn accrued_fee_collateral_atoms(&self) -> StateResult<u128> {
         if !self.is_matured() {
             return Err(StateError::MarketNotMatured);
@@ -485,24 +433,7 @@ impl MarketState {
             return Err(StateError::UnsettledOpenInterest);
         }
 
-        let fees = self.accrued_protocol_fee_atoms;
-
-        if fees == 0 {
-            return Ok(0);
-        }
-
-        if self.config.collateral_state == self.config.settlement_state {
-            return Ok(fees);
-        }
-
-        let fees = i128::try_from(fees).map_err(|_| StateError::ArithmeticOverflow)?;
-
-        let collateral = self
-            .frozen_settlement_ratio()
-            .ok_or(StateError::MissingSettlementRatio)?
-            .apply(fees)?;
-
-        u128::try_from(collateral).map_err(|_| StateError::ArithmeticOverflow)
+        Ok(self.accrued_protocol_fee_atoms)
     }
 
     /// Zeros booked fees on the supplied matured markets and returns the
@@ -637,7 +568,7 @@ impl MarketState {
                 time_to_maturity,
                 SECONDS_PER_YEAR,
                 self.config.underlying_decimals,
-                self.config.settlement_decimals,
+                super::USDC_DECIMALS,
                 self.config.tick_scale,
             )
             .map_err(|_| StateError::ArithmeticOverflow)?;
@@ -761,7 +692,7 @@ impl MarketState {
                 time_to_maturity,
                 SECONDS_PER_YEAR,
                 self.config.underlying_decimals,
-                self.config.settlement_decimals,
+                super::USDC_DECIMALS,
                 self.config.tick_scale,
             )
             .map_err(|_| StateError::ArithmeticOverflow)?;
@@ -839,7 +770,7 @@ impl MarketState {
         let year =
             I64F64::checked_from_num(SECONDS_PER_YEAR).ok_or(StateError::ArithmeticOverflow)?;
         let market_scale = decimal_scale(self.config.tick_scale)?;
-        let settlement_scale = decimal_scale(self.config.settlement_decimals)?;
+        let settlement_scale = decimal_scale(super::USDC_DECIMALS)?;
         let maturity_scaled_rate = rate
             .checked_mul(elapsed)
             .and_then(|value| value.checked_mul(market_scale))
@@ -1173,7 +1104,6 @@ impl VenueAdapterConfig {
                 if payload.layout.0 != 1
                     || payload.global_configuration == Pubkey::default()
                     || payload.perp_asset_map == Pubkey::default()
-                    || payload.canonical_quote_mint == Pubkey::default()
                     || payload.market_account == Pubkey::default()
                     || payload.symbol == [0; 16]
                     || payload.tick_size == 0
@@ -1202,9 +1132,7 @@ impl MarketConfig {
         maturity_timestamp: i64,
         minimum_position_size_atoms: u64,
         maximum_position_size_atoms: u64,
-        collateral_state: Pubkey,
-        settlement_state: Pubkey,
-        underlying_state: Pubkey,
+        underlying_oracle: OracleConfig,
         adapter: VenueAdapterConfig,
         rate_floor: FixedPoint,
         initial_margin_factor: FixedPoint,
@@ -1222,7 +1150,6 @@ impl MarketConfig {
         margin_time_threshold_seconds: u32,
         tick_scale: u8,
         underlying_decimals: u8,
-        settlement_decimals: u8,
     ) -> StateResult<()> {
         *self = Self {
             hard_gross_open_interest_cap_atoms,
@@ -1230,9 +1157,7 @@ impl MarketConfig {
             maturity_timestamp,
             minimum_position_size_atoms,
             maximum_position_size_atoms,
-            collateral_state,
-            settlement_state,
-            underlying_state,
+            underlying_oracle,
             adapter,
             rate_floor,
             initial_margin_factor,
@@ -1250,10 +1175,8 @@ impl MarketConfig {
             margin_time_threshold_seconds,
             tick_scale,
             underlying_decimals,
-            settlement_decimals,
             pm_cache_nonce: 0,
-            _pad_0: [0; 16],
-            _pad_units: 0,
+            _pad_units: [0; 2],
             reserved: [0; MARKET_CONFIG_RESERVED],
             _pad_2: [0; 12],
             _pad_3: [0; 12],
@@ -1264,11 +1187,11 @@ impl MarketConfig {
 
     /// Clears all configuration padding before the configuration is persisted.
     fn zero_opaque_bytes(&mut self) -> StateResult<()> {
-        self._pad_0 = [0; 16];
+        self.underlying_oracle._pad = [0; 8];
         self.reserved = [0; MARKET_CONFIG_RESERVED];
         self._pad_2 = [0; 12];
         self._pad_3 = [0; 12];
-        self._pad_units = 0;
+        self._pad_units = [0; 2];
         self.adapter.zero_opaque_bytes()
     }
 
@@ -1276,7 +1199,6 @@ impl MarketConfig {
     pub fn validate(&self) -> StateResult<()> {
         if self.tick_scale > fixed_perp_math::rate::MAX_DECIMALS
             || self.underlying_decimals > fixed_perp_math::rate::MAX_DECIMALS
-            || self.settlement_decimals > fixed_perp_math::rate::MAX_DECIMALS
         {
             return Err(StateError::InvalidAssetDecimals);
         }
@@ -1290,11 +1212,8 @@ impl MarketConfig {
         if self.market_id == 0 {
             return Err(StateError::InvalidMarket);
         }
-        if self.collateral_state == Pubkey::default()
-            || self.settlement_state == Pubkey::default()
-            || self.underlying_state == Pubkey::default()
-        {
-            return Err(StateError::InvalidAccountKey);
+        if self.adapter_kind().0 == ADAPTER_PHOENIX {
+            self.underlying_oracle.validate()?;
         }
         if self.hard_gross_open_interest_cap_atoms == 0
             || self.minimum_position_size_atoms == 0
@@ -1335,27 +1254,6 @@ impl MarketConfig {
     /// Returns the adapter tag for callers selecting a validated venue path.
     pub fn adapter_kind(&self) -> VenueAdapterKind {
         self.adapter.kind
-    }
-
-    /// Confirms immutable decimal metadata read from the configured AssetState accounts.
-    pub fn validate_asset_decimals(
-        &self,
-        underlying_decimals: u8,
-        settlement_decimals: u8,
-    ) -> StateResult<()> {
-        if underlying_decimals > fixed_perp_math::rate::MAX_DECIMALS
-            || settlement_decimals > fixed_perp_math::rate::MAX_DECIMALS
-            || self.underlying_decimals != underlying_decimals
-            || self.settlement_decimals != settlement_decimals
-        {
-            return Err(StateError::InvalidAssetDecimals);
-        }
-
-        Ok(())
-    }
-
-    pub fn is_same_collateral_state(&self, state: Pubkey) -> bool {
-        self.collateral_state == state
     }
 }
 
@@ -1407,12 +1305,11 @@ impl MarketState {
             source_seeded: stored_source_seeded,
             _pad_0: stored_pad_0,
             subaccount_count: stored_subaccount_count,
-            frozen_settlement_ratio: stored_frozen_settlement_ratio,
             finalized_at_timestamp: stored_finalized_at_timestamp,
+            _pad_tail: stored_pad_tail,
             reserved: stored_reserved,
             order_book: _,
             _pad_open_interest: stored_pad_open_interest,
-            _pad_settlement_ratio: stored_pad_settlement_ratio,
         } = self;
         *stored_config = config;
         *stored_floating_index = FixedPoint::zeroed();
@@ -1436,13 +1333,10 @@ impl MarketState {
         *stored_source_seeded = 0;
         *stored_pad_0 = [0; 2];
         *stored_subaccount_count = 0;
-        *stored_frozen_settlement_ratio = SettlementRatio::zeroed();
         *stored_finalized_at_timestamp = 0;
+        *stored_pad_tail = [0; 8];
         *stored_reserved = [0; MARKET_STATE_RESERVED];
         *stored_pad_open_interest = MarketAlignmentPadding {
-            bytes: [0; MARKET_U128_PADDING],
-        };
-        *stored_pad_settlement_ratio = MarketAlignmentPadding {
             bytes: [0; MARKET_U128_PADDING],
         };
 
@@ -1498,14 +1392,17 @@ impl MarketState {
     fn order_risk_scale(&self) -> OrderRiskScale {
         OrderRiskScale {
             underlying_decimals: self.config.underlying_decimals,
-            settlement_decimals: self.config.settlement_decimals,
             tick_scale: self.config.tick_scale,
         }
     }
 
-    /// Advances fees with a freshly authenticated underlying/settlement price
-    /// supplied by the caller's AssetState/Pyth pair.
-    pub fn advance_fee_index_with_price(&mut self, now: i64, price: FixedPoint) -> StateResult<()> {
+    /// Advances fees with a freshly authenticated underlying USD price
+    /// supplied by the market's authenticated underlying USD feed.
+    pub fn advance_fee_index_with_price(
+        &mut self,
+        now: i64,
+        underlying_usdc_price: FixedPoint,
+    ) -> StateResult<()> {
         if now < self.protocol_checkpoint_timestamp {
             return Err(StateError::InvalidClock);
         }
@@ -1520,7 +1417,7 @@ impl MarketState {
             return Ok(());
         }
 
-        if price.to_raw_bits() <= 0 {
+        if underlying_usdc_price.to_raw_bits() <= 0 {
             return Err(StateError::InvalidOraclePrice);
         }
 
@@ -1538,7 +1435,7 @@ impl MarketState {
 
         let delta = fee_rate
             .checked_mul(market_scale)
-            .and_then(|value| value.checked_mul(price.to_i64f64()))
+            .and_then(|value| value.checked_mul(underlying_usdc_price.to_i64f64()))
             .and_then(|value| value.checked_mul(elapsed))
             .and_then(|value| value.checked_div(year))
             .ok_or(StateError::ArithmeticOverflow)?;
@@ -1555,38 +1452,15 @@ impl MarketState {
         Ok(())
     }
 
-    pub fn apply_rate_observation_with_price(
-        &mut self,
-        dimensionless_delta: RateDelta,
-        source_checkpoint: u128,
-        source_last_update_timestamp: i64,
-        checkpoint_epoch: u64,
-        now: i64,
-        price: FixedPoint,
-    ) -> StateResult<()> {
-        let weighted_delta = dimensionless_delta
-            .to_i64f64()
-            .checked_mul(price.to_i64f64())
-            .ok_or(StateError::ArithmeticOverflow)?;
-
-        self.apply_weighted_rate_observation_with_price(
-            RateDelta::from_i64f64(weighted_delta),
-            source_checkpoint,
-            source_last_update_timestamp,
-            checkpoint_epoch,
-            now,
-            price,
-        )
-    }
-
-    pub fn apply_weighted_rate_observation_with_price(
+    /// Stores a quote-denominated funding delta. Underlying underlying_usdc_price is used only for fees.
+    pub fn apply_rate_observation(
         &mut self,
         weighted_delta: RateDelta,
         source_checkpoint: u128,
         source_last_update_timestamp: i64,
         checkpoint_epoch: u64,
         now: i64,
-        price: FixedPoint,
+        underlying_usdc_price: FixedPoint,
     ) -> StateResult<()> {
         let market_scale = decimal_scale(self.config.tick_scale)?;
 
@@ -1606,7 +1480,7 @@ impl MarketState {
         let fee_now = now.min(self.config.maturity_timestamp);
 
         if fee_now >= self.protocol_checkpoint_timestamp {
-            self.advance_fee_index_with_price(fee_now, price)?;
+            self.advance_fee_index_with_price(fee_now, underlying_usdc_price)?;
         }
 
         self.floating_index = FixedPoint::from_raw_bits(next_floating_index.to_bits());
@@ -2654,7 +2528,7 @@ impl MarketState {
         .floating_payment_atoms_scaled(
             i128::from(market_slot.position_size),
             self.config.underlying_decimals,
-            self.config.settlement_decimals,
+            super::USDC_DECIMALS,
             self.config.tick_scale,
         )
         .map_err(|_| StateError::ArithmeticOverflow)?;
@@ -2672,7 +2546,7 @@ impl MarketState {
             fee.settlement_fee_atoms_scaled(
                 market_slot.position_size.unsigned_abs().into(),
                 self.config.underlying_decimals,
-                self.config.settlement_decimals,
+                super::USDC_DECIMALS,
                 self.config.tick_scale,
             )
         })
@@ -2763,7 +2637,7 @@ impl MarketState {
         .floating_payment_atoms_scaled(
             1,
             self.config.underlying_decimals,
-            self.config.settlement_decimals,
+            super::USDC_DECIMALS,
             self.config.tick_scale,
         )
         .map_err(|_| StateError::ArithmeticOverflow)?;
@@ -2780,7 +2654,7 @@ impl MarketState {
         .settlement_fee_atoms_scaled(
             1,
             self.config.underlying_decimals,
-            self.config.settlement_decimals,
+            super::USDC_DECIMALS,
             self.config.tick_scale,
         )
         .map_err(|_| StateError::ArithmeticOverflow)?;
@@ -2848,7 +2722,7 @@ impl MarketState {
                 time_to_maturity,
                 SECONDS_PER_YEAR,
                 self.config.underlying_decimals,
-                self.config.settlement_decimals,
+                super::USDC_DECIMALS,
                 self.config.tick_scale,
             )
             .map_err(|_| StateError::ArithmeticOverflow)
@@ -2868,7 +2742,7 @@ impl MarketState {
         // fee is not truncated at Q64.64 precision. The conversion below
         // removes tick scale and normalizes the underlying atoms once.
         let market_scale = decimal_scale(self.config.tick_scale)?;
-        let settlement_scale = decimal_scale(self.config.settlement_decimals)?;
+        let settlement_scale = decimal_scale(super::USDC_DECIMALS)?;
 
         let maturity_scaled_rate = rate
             .checked_mul(elapsed)
@@ -3110,7 +2984,7 @@ impl MarketState {
                 time_to_maturity,
                 SECONDS_PER_YEAR,
                 self.config.underlying_decimals,
-                self.config.settlement_decimals,
+                super::USDC_DECIMALS,
                 self.config.tick_scale,
             )
             .map_err(|_| StateError::ArithmeticOverflow)
@@ -3481,11 +3355,11 @@ pub fn aggregate_is_closing_action(
 ///
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PortfolioHealth {
-    /// Adjusted collateral and settlement balances in the common numeraire.
+    /// Collateral and settlement cash in USDC atoms.
     pub adjusted_total_assets: i128,
-    /// Signed position value in the common numeraire.
+    /// Signed position value in USDC atoms.
     pub total_value: i128,
-    /// Selected margin requirement, valued in the portfolio numeraire.
+    /// Selected margin requirement in USDC atoms.
     pub required_margin: MarginRequirement,
 }
 
@@ -3622,18 +3496,6 @@ impl PortfolioHealth {
 }
 
 impl MarginGroup {
-    /// Ensures the group and market reference the same collateral and
-    /// settlement AssetState accounts.
-    pub fn ensure_market_assets_match(&self, market: &MarketState) -> StateResult<()> {
-        if self.collateral_state != market.config.collateral_state
-            || self.settlement_state != market.config.settlement_state
-        {
-            return Err(StateError::MarketAssetMismatch);
-        }
-
-        Ok(())
-    }
-
     /// Ensures the subaccount belongs to this group.
     pub fn ensure_subaccount_matches(&self, subaccount: &Subaccount) -> StateResult<()> {
         if self.group_id != subaccount.group_id {
@@ -3643,7 +3505,7 @@ impl MarginGroup {
         Ok(())
     }
 
-    /// Initializes immutable group identity, AssetState references, and health
+    /// Initializes immutable group identity and health
     /// thresholds from caller input.
     ///
     /// Membership is established by creating the discriminator-only
@@ -3652,16 +3514,11 @@ impl MarginGroup {
         &mut self,
         bump: u8,
         group_id: u16,
-        collateral_state: Pubkey,
-        settlement_state: Pubkey,
         critical_health_ratio: FixedPoint,
         risky_order_cancellation_ratio: FixedPoint,
     ) -> StateResult<()> {
         if group_id == 0 {
             return Err(StateError::InvalidGroupID);
-        }
-        if collateral_state == Pubkey::default() || settlement_state == Pubkey::default() {
-            return Err(StateError::InvalidAccountKey);
         }
         if critical_health_ratio.to_raw_bits() <= 0
             || risky_order_cancellation_ratio.to_raw_bits() < critical_health_ratio.to_raw_bits()
@@ -3669,23 +3526,14 @@ impl MarginGroup {
             return Err(StateError::InvalidGroupHealthRatios);
         }
 
-        let one = FixedPoint::from_raw_bits(1i128 << 64);
-        let factors = ValuationFactors {
-            discount_factor: one,
-            liability_factor: one,
-        };
         *self = Self {
             group_id,
             bump,
             status: GROUP_PENDING,
-            collateral_state,
-            settlement_state,
             critical_health_ratio,
             risky_order_cancellation_ratio,
             market_count: 0,
             subaccount_count: 0,
-            collateral_factors: factors,
-            settlement_factors: factors,
             _pad_0: [0; 4],
             reserved: [0; MARGIN_GROUP_RESERVED],
         };
@@ -3698,182 +3546,85 @@ impl MarginGroup {
         self.status = GROUP_ACTIVE;
     }
 
-    /// Computes portfolio health from the transient AssetState observations
-    /// supplied by the caller while preserving the same sign-directed
-    /// arithmetic.
-    #[allow(clippy::too_many_arguments)]
-    pub fn initial_portfolio_health_with_assets<'a>(
+    /// Computes health in USDC atoms. Callers gate risk-sensitive actions on the USDC oracle.
+    pub fn initial_portfolio_health<'a>(
         &self,
         subaccount: &Subaccount,
-        collateral_asset: &AssetState,
-        collateral_observation: OracleObservation,
-        settlement_asset: &AssetState,
-        settlement_observation: OracleObservation,
-        markets: impl IntoIterator<Item = PortfolioMarketObservation<'a>>,
+        markets: impl IntoIterator<Item = &'a MarketState>,
         now: i64,
     ) -> StateResult<PortfolioHealth> {
-        self.portfolio_health_with_assets(
-            subaccount,
-            collateral_asset,
-            collateral_observation,
-            settlement_asset,
-            settlement_observation,
-            markets,
-            now,
-            MarginRequirementType::Initial,
-        )
+        self.portfolio_health(subaccount, markets, now, MarginRequirementType::Initial)
     }
 
-    /// Maintenance-margin form of [`Self::initial_portfolio_health_with_assets`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn maintenance_portfolio_health_with_assets<'a>(
+    pub fn maintenance_portfolio_health<'a>(
         &self,
         subaccount: &Subaccount,
-        collateral_asset: &AssetState,
-        collateral_observation: OracleObservation,
-        settlement_asset: &AssetState,
-        settlement_observation: OracleObservation,
-        markets: impl IntoIterator<Item = PortfolioMarketObservation<'a>>,
+        markets: impl IntoIterator<Item = &'a MarketState>,
         now: i64,
     ) -> StateResult<PortfolioHealth> {
-        self.portfolio_health_with_assets(
-            subaccount,
-            collateral_asset,
-            collateral_observation,
-            settlement_asset,
-            settlement_observation,
-            markets,
-            now,
-            MarginRequirementType::Maintenance,
-        )
+        self.portfolio_health(subaccount, markets, now, MarginRequirementType::Maintenance)
     }
 
-    /// The observations should be validated before calling this.
-    #[allow(clippy::too_many_arguments)]
-    fn portfolio_health_with_assets<'a>(
+    fn portfolio_health<'a>(
         &self,
         subaccount: &Subaccount,
-        collateral_asset: &AssetState,
-        collateral_observation: OracleObservation,
-        settlement_asset: &AssetState,
-        settlement_observation: OracleObservation,
-        markets: impl IntoIterator<Item = PortfolioMarketObservation<'a>>,
+        markets: impl IntoIterator<Item = &'a MarketState>,
         now: i64,
         requirement_type: MarginRequirementType,
     ) -> StateResult<PortfolioHealth> {
-        let mut markets_by_slot: [Option<PortfolioMarketObservation<'a>>; super::MAX_MARKETS] =
-            [None; super::MAX_MARKETS];
-
-        for observation in markets {
-            let Some(slot) = subaccount.lookup_market(observation.market.config.market_id) else {
-                continue;
-            };
-
-            markets_by_slot[slot] = Some(observation);
+        let mut markets_by_slot = [None; super::MAX_MARKETS];
+        for market in markets {
+            if let Some(slot) = subaccount.lookup_market(market.config.market_id) {
+                markets_by_slot[slot] = Some(market);
+            }
         }
-
-        let collateral_adjusted = self
-            .collateral_factors
-            .apply(subaccount.collateral_balance_atoms)?;
-
-        let collateral_endpoint = PriceEndpoint::for_signed_value(collateral_adjusted);
-
-        let mut assets = collateral_observation
-            .conservative_price_for(collateral_asset, collateral_endpoint)?
-            .scaled_value_atoms(collateral_adjusted, collateral_asset.decimals)
-            .map_err(|_| StateError::ArithmeticOverflow)?;
-
+        let mut assets = subaccount.collateral_balance_atoms;
         let mut total_value = 0i128;
         let mut total_margin = 0i128;
-
         for (slot_index, slot) in subaccount.markets.iter().enumerate() {
             if slot.market_id == 0 {
                 continue;
             }
-
-            let observation =
-                markets_by_slot[slot_index].ok_or(StateError::MissingMarketObservation)?;
-            let market = observation.market;
-
+            let market = markets_by_slot[slot_index].ok_or(StateError::MissingMarketObservation)?;
             let time = market
                 .config
                 .maturity_timestamp
                 .checked_sub(now)
                 .ok_or(StateError::InvalidClock)?;
-
             let mark = market.current_mark_rate(now)?;
-            let position_value = market.position_value(slot.position_size, mark, time)?;
-            let position_value = market.position_factors.apply(position_value)?;
-
-            // Fixed quotes already price the underlying in settlement units.
-            // Apply the conservative settlement price only when valuing that cash.
-            let position_endpoint = PriceEndpoint::for_signed_value(position_value);
-            let conservative_settlement_price = settlement_observation
-                .conservative_price_for(settlement_asset, position_endpoint)?;
-            let position_value = self.settlement_factors.apply(position_value)?;
-
+            let value = market.position_factors.apply(market.position_value(
+                slot.position_size,
+                mark,
+                time,
+            )?)?;
             total_value = total_value
-                .checked_add(
-                    conservative_settlement_price
-                        .scaled_value_atoms(position_value, settlement_asset.decimals)
-                        .map_err(|_| StateError::ArithmeticOverflow)?,
-                )
+                .checked_add(value)
                 .ok_or(StateError::ArithmeticOverflow)?;
-
-            let balance = self
-                .settlement_factors
-                .apply(slot.settlement_balance_atoms)?;
-
-            let balance_endpoint = PriceEndpoint::for_signed_value(balance);
-
-            let balance_price = settlement_observation
-                .conservative_price_for(settlement_asset, balance_endpoint)?;
-
+            let balance = slot.settlement_balance_atoms;
             assets = assets
-                .checked_add(
-                    balance_price
-                        .scaled_value_atoms(balance, settlement_asset.decimals)
-                        .map_err(|_| StateError::ArithmeticOverflow)?,
-                )
+                .checked_add(balance)
                 .ok_or(StateError::ArithmeticOverflow)?;
-
-            // Resting orders reserve initial margin but do not contribute to maintenance margin.
             let margin = match requirement_type {
-                MarginRequirementType::Initial => {
-                    let risk = market.risk_principal(slot.position_size, &slot.order_risk, mark)?;
-                    market.initial_margin(risk, time)?
-                }
-                MarginRequirementType::Maintenance => {
-                    let risk = market.position_risk_principal(slot.position_size, mark)?;
-                    market.maintenance_margin(risk, time)?
-                }
+                MarginRequirementType::Initial => market.initial_margin(
+                    market.risk_principal(slot.position_size, &slot.order_risk, mark)?,
+                    time,
+                )?,
+                MarginRequirementType::Maintenance => market.maintenance_margin(
+                    market.position_risk_principal(slot.position_size, mark)?,
+                    time,
+                )?,
             };
-
-            let margin = self.settlement_factors.apply(-margin)?;
-            let margin_endpoint = PriceEndpoint::for_signed_value(margin);
-            let margin_price =
-                settlement_observation.conservative_price_for(settlement_asset, margin_endpoint)?;
-
             total_margin = total_margin
-                .checked_add(
-                    margin_price
-                        .scaled_value_atoms(margin, settlement_asset.decimals)
-                        .map_err(|_| StateError::ArithmeticOverflow)?
-                        .checked_neg()
-                        .ok_or(StateError::ArithmeticOverflow)?,
-                )
+                .checked_add(margin)
                 .ok_or(StateError::ArithmeticOverflow)?;
         }
-
-        let required_margin = match requirement_type {
-            MarginRequirementType::Initial => MarginRequirement::Initial(total_margin),
-            MarginRequirementType::Maintenance => MarginRequirement::Maintenance(total_margin),
-        };
-
         Ok(PortfolioHealth {
             adjusted_total_assets: assets,
             total_value,
-            required_margin,
+            required_margin: match requirement_type {
+                MarginRequirementType::Initial => MarginRequirement::Initial(total_margin),
+                MarginRequirementType::Maintenance => MarginRequirement::Maintenance(total_margin),
+            },
         })
     }
 

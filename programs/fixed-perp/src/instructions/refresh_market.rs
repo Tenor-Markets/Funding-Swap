@@ -7,7 +7,7 @@ use fixed_perp_adapters::{
     AccountView, ObservationContext, ObservationLimits,
 };
 
-use crate::instructions::oracle::{read_asset_observation, underlying_settlement_price};
+use crate::instructions::oracle::read_usdc_observation;
 use crate::state::{MarketState, StateError, VenueAdapterKind, ADAPTER_JUPITER, ADAPTER_PHOENIX};
 
 const REFRESH_EPOCH_SECONDS: i64 = 3_600;
@@ -63,21 +63,31 @@ fn decode_signed_checkpoint(checkpoint: u128) -> Result<i64> {
     i64::try_from(signed).map_err(|_| StateError::InvalidSourceCheckpoint.into())
 }
 
-/// Reads the underlying and settlement observations before the venue source
-/// accounts and returns the price used to build settlement-denominated index
-/// deltas. Fixed USD Jupiter assets therefore produce a unit price.
-fn read_index_price<'info>(
+/// USDC is accepted at par. Phoenix market fees still use its underlying USD price;
+/// Jupiter's notional is already USD, so its underlying price is one.
+pub(crate) fn read_fee_price<'info>(
     market: &MarketState,
     accounts: &'info [AccountInfo<'info>],
     now: i64,
 ) -> Result<(usize, fixed_perp_math::FixedPoint)> {
-    let (underlying, remaining) =
-        read_asset_observation(accounts, market.config.underlying_state, now)?;
+    let mut remaining = read_usdc_observation(accounts, now)?;
 
-    let (settlement, remaining) =
-        read_asset_observation(remaining, market.config.settlement_state, now)?;
+    let price = if market.config.adapter_kind().0 == ADAPTER_JUPITER {
+        crate::state::FixedPoint::from_raw_bits(1i128 << 64)
+    } else {
+        let (feed, rest) = remaining
+            .split_first()
+            .ok_or(StateError::InvalidRemainingAccounts)?;
 
-    let price = underlying_settlement_price(&underlying, &settlement)?;
+        remaining = rest;
+
+        crate::state::OracleObservation::from_pyth_account(
+            feed,
+            &market.config.underlying_oracle,
+            now,
+        )?
+        .normalized_price
+    };
 
     Ok((accounts.len() - remaining.len(), price))
 }
@@ -102,14 +112,14 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
         return Ok(());
     }
 
-    let (source_offset, underlying_settlement_price) =
-        read_index_price(&market, context.remaining_accounts, now)?;
+    let (source_offset, underlying_usdc_price) =
+        read_fee_price(&market, context.remaining_accounts, now)?;
 
     let adapter_kind = market.config.adapter_kind();
     let previous_checkpoint = market.source_native_checkpoint;
     let previous_protocol_checkpoint_at = market.protocol_checkpoint_timestamp;
 
-    let (rate_delta, next_checkpoint, source_timestamp, already_weighted) = match adapter_kind {
+    let (rate_delta, next_checkpoint, source_timestamp) = match adapter_kind {
         VenueAdapterKind(ADAPTER_JUPITER) => {
             if context
                 .remaining_accounts
@@ -154,7 +164,6 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
                 observation.rate_delta,
                 observation.source_checkpoint,
                 observation.source_last_update_timestamp,
-                false,
             )
         }
         VenueAdapterKind(ADAPTER_PHOENIX) => {
@@ -173,7 +182,7 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
                 layout: PhoenixLayout::V1,
                 global_configuration: payload.global_configuration,
                 perp_asset_map: payload.perp_asset_map,
-                canonical_quote_mint: payload.canonical_quote_mint,
+                canonical_quote_mint: crate::state::PHOENIX_QUOTE_MINT,
                 asset_slot: payload.asset_slot,
                 symbol: payload.symbol,
                 asset_id: payload.asset_id,
@@ -217,7 +226,6 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
                 observation.rate_delta,
                 encode_signed_checkpoint(observation.source_checkpoint),
                 source_timestamp,
-                true,
             )
         }
         _ => return Err(StateError::InvalidAdapterKind.into()),
@@ -225,29 +233,17 @@ pub fn handle_refresh_market<'info>(context: Context<'info, RefreshMarket<'info>
 
     drop(market);
 
-    // The state helper applies the authenticated current price and stages both
-    // index transitions before committing any field.
+    // Both sources are already monetary: Jupiter is USD per USD of notional;
+    // Phoenix is normalized phUSD per underlying unit.
     let mut market = context.accounts.market.load_mut()?;
-
-    if already_weighted {
-        market.apply_weighted_rate_observation_with_price(
-            rate_delta,
-            next_checkpoint,
-            source_timestamp,
-            epoch,
-            now,
-            underlying_settlement_price,
-        )?;
-    } else {
-        market.apply_rate_observation_with_price(
-            rate_delta,
-            next_checkpoint,
-            source_timestamp,
-            epoch,
-            now,
-            underlying_settlement_price,
-        )?;
-    }
+    market.apply_rate_observation(
+        rate_delta,
+        next_checkpoint,
+        source_timestamp,
+        epoch,
+        now,
+        underlying_usdc_price,
+    )?;
 
     Ok(())
 }
@@ -311,7 +307,7 @@ pub fn handle_seed_market_source<'info>(
                 layout: PhoenixLayout::V1,
                 global_configuration: payload.global_configuration,
                 perp_asset_map: payload.perp_asset_map,
-                canonical_quote_mint: payload.canonical_quote_mint,
+                canonical_quote_mint: crate::state::PHOENIX_QUOTE_MINT,
                 asset_slot: payload.asset_slot,
                 symbol: payload.symbol,
                 asset_id: payload.asset_id,

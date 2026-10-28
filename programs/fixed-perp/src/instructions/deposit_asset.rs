@@ -12,6 +12,7 @@ pub struct DepositAsset<'info> {
         token::authority = depositor
     )]
     pub source: Account<'info, TokenAccount>,
+    #[account(address = crate::state::USDC_MINT)]
     pub mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -20,13 +21,13 @@ pub struct DepositAsset<'info> {
     )]
     pub token_vault: Account<'info, TokenAccount>,
     #[account(
+        seeds = [crate::state::USDC_SEED], bump = asset.load()?.bump,
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
         constraint = asset.load()?.is_valid_custody(token_vault.key()) @ StateError::InvalidTargetCustody
     )]
     pub asset: AccountLoader<'info, AssetState>,
     #[account(
         constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus,
-        constraint = margin_group.load()?.is_same_collateral_state(asset.key()) @ StateError::InvalidAccountKey
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
     #[account(
