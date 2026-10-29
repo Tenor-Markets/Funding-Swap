@@ -1,48 +1,20 @@
-# Protocol
+# Funding Swap
 
-Lean Solana math primitives and the production Anchor program scaffold.
+> **Status:** This code is unaudited and untested.
 
-The workspace is intentionally narrow:
+Funding Swap lets traders swap fixed funding for floating funding on Solana. A
+position pays or receives a fixed annualized rate while the opposite leg tracks
+the funding or carry actually charged by a venue over the market's duration.
 
-- `crates/fixed-perp-math` holds the checked fixed-point primitives.
-- `programs/fixed-perp` holds the production Anchor program scaffold.
-- [USDC accounting](guide/usdc-accounting.md) specifies the current currency, oracle,
-  custody, and settlement interfaces.
-- `guide/guide.md` contains the broader protocol design; its `DONT TOUCH` suffix
-  remains byte-for-byte protected.
+Phoenix Rise supplies a signed cumulative funding checkpoint. Funding Swap
+weights that quote-denominated funding by price to obtain the settlement value
+used for user size. The trader who pays fixed receives the floating USDC
+settlement over that period.
 
-Governance uses [eight direct authorities](guide/governance.md), with approval
-and timelocks delegated to Squads. The governance and USDC refactors change account
-layouts and instruction interfaces; existing accounts need a separate migration
-or fresh deployment.
+Jupiter Perps supplies a continuous borrow/lock carry rate. The same fixed-vs-
+floating swap is opened against that source for the market's duration.
 
-## Pinned environment
-
-- Host Rust is selected locally by `rust-toolchain.toml` at `1.90.0`.
-- The Rust packages retain `rust-version = "1.89"` because Solana CLI 3.1.15 builds SBF with its Rust 1.89 compiler.
-- Anchor CLI and the `anchor-lang` and `anchor-client` crates are pinned to `1.0.2`.
-- Solana CLI is pinned to `3.1.15`.
-- Cargo selects `/usr/bin/gcc` for the x86_64 host linker through `.cargo/config.toml`.
-
-The workspace pin does not change the global rustup default. Opening this directory causes rustup and rust-analyzer to select Rust 1.90.0 for this workspace.
-
-## Build and test
-
-From this directory, run the plain repository commands without shell environment overrides:
-
-```bash
-anchor build
-cargo test -p fixed-perp-math
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-## VS Code on WSL
-
-Install the WSL extension once, then open the pinned workspace:
-
-```bash
-code --install-extension rust-lang.rust-analyzer
-code /home/orinayo/dev/solana/fixed-perp/protocol
-```
-
-If this directory was already open before the toolchain pin changed, run `Developer: Reload Window` in VS Code.
+USDC is the single collateral and settlement asset. Different markets may use
+different underlyings.
+The design is inspired by Boros. The whitepaper is available at
+https://github.com/pendle-finance/boros-core-public/blob/main/whitepapers/Boros.pdf

@@ -1,0 +1,38 @@
+[package]
+name = "funding-swap"
+version = "0.1.0"
+description = "Funding Swap Solana program"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "funding_swap"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "funding-swap-math/anchor-idl"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = "=1.0.2"
+anchor-spl = { version = "=1.0.2", features = ["token"] }
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+fixed = { version = "=1.28.0", default-features = false }
+funding-swap-error = { path = "../../crates/funding-swap-error" }
+funding-swap-adapters = { path = "../../crates/funding-swap-adapters" }
+funding-swap-math = { path = "../../crates/funding-swap-math" }
+pyth-solana-receiver-sdk = "2.0.0"
+
+[dev-dependencies]
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+proptest = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

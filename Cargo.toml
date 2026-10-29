@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/fixed-perp-error",
-    "crates/fixed-perp-adapters",
-    "crates/fixed-perp-math",
-    "programs/fixed-perp",
+    "crates/funding-swap-error",
+    "crates/funding-swap-adapters",
+    "crates/funding-swap-math",
+    "programs/funding-swap",
 ]
 resolver = "2"
 

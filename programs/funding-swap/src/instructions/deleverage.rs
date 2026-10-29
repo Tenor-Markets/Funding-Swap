@@ -1,0 +1,168 @@
+use anchor_lang::prelude::*;
+
+use crate::instructions::liquidate::{maintenance_health, materialize_entered};
+use crate::instructions::oracle::{market_observation_for, read_observation_set, ObservationSet};
+use crate::state::{
+    FixedPoint, GlobalGovernanceConfig, GovernanceCategory, MarginGroup, StateError, Subaccount,
+    MAX_MARKETS,
+};
+
+#[derive(Accounts)]
+pub struct Deleverage<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [b"governance"], bump = global_governance.load()?.bump,
+        constraint = global_governance.load()?.authority_for(
+            GovernanceCategory::Deleveraging,
+            authority.key(),
+        ) @ StateError::InvalidAuthority
+    )]
+    pub global_governance: AccountLoader<'info, GlobalGovernanceConfig>,
+    #[account(
+        mut,
+        constraint = winner.key() != loser.key() @ StateError::DuplicateSubaccount,
+        constraint = winner.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID
+    )]
+    pub winner: AccountLoader<'info, Subaccount>,
+    #[account(
+        mut,
+        constraint = loser.load()?.is_same_group_id(margin_group.load()?.group_id) @ StateError::InvalidGroupID
+    )]
+    pub loser: AccountLoader<'info, Subaccount>,
+    #[account(constraint = margin_group.load()?.is_active() @ StateError::InvalidStatus)]
+    pub margin_group: AccountLoader<'info, MarginGroup>,
+}
+
+#[event]
+pub struct ForcedDeleverage {
+    pub winner: Pubkey,
+    pub loser: Pubkey,
+    pub market_id: u64,
+    pub size_to_winner: i64,
+    pub alpha_raw: i128,
+    pub loss_atoms: i128,
+}
+
+pub fn handle_deleverage<'info>(
+    context: Context<'info, Deleverage<'info>>,
+    market_id: u64,
+    size_to_winner: i64,
+    alpha_raw: i128,
+) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
+    let group = context.accounts.margin_group.load()?;
+    // Both users can hold a full, disjoint set of markets.
+    let (observations, _) =
+        read_observation_set::<{ MAX_MARKETS * 2 }>(context.remaining_accounts, now)?;
+    drop(group);
+    execute_deleverage(
+        context.accounts,
+        &observations,
+        now,
+        market_id,
+        size_to_winner,
+        alpha_raw,
+    )
+}
+
+// Keep the observation array in the caller's frame, as in the order handlers.
+#[inline(never)]
+fn execute_deleverage<'info>(
+    accounts: &Deleverage<'info>,
+    observations: &ObservationSet<'info, { MAX_MARKETS * 2 }>,
+    now: i64,
+    market_id: u64,
+    size_to_winner: i64,
+    alpha_raw: i128,
+) -> Result<()> {
+    let group = accounts.margin_group.load()?;
+    let entry = market_observation_for(observations, market_id)?;
+
+    {
+        let mut winner = accounts.winner.load_mut()?;
+        let mut loser = accounts.loser.load_mut()?;
+        materialize_entered(&mut winner, observations, now)?;
+        materialize_entered(&mut loser, observations, now)?;
+    }
+
+    {
+        let winner = accounts.winner.load()?;
+        let loser = accounts.loser.load()?;
+        let winner_ratio =
+            maintenance_health(&group, &winner, observations, now)?.maintenance_health_ratio()?;
+        let loser_ratio =
+            maintenance_health(&group, &loser, observations, now)?.maintenance_health_ratio()?;
+        // The paper requires the winner to be strictly healthier. Boros checks
+        // that outside the market, and this instruction is that caller.
+        if winner_ratio.to_raw_bits() <= loser_ratio.to_raw_bits() {
+            return Err(StateError::WinnerNotHealthier.into());
+        }
+    }
+
+    let loser_value = {
+        let loser = accounts.loser.load()?;
+        portfolio_settlement_value(&loser, observations, now)?
+    };
+    let alpha = FixedPoint::from_raw_bits(alpha_raw);
+    let loss = {
+        let mut winner = accounts.winner.load_mut()?;
+        let mut loser = accounts.loser.load_mut()?;
+        let mut market = entry.loader.load_mut()?;
+        market.deleverage(
+            &mut winner,
+            &mut loser,
+            size_to_winner,
+            loser_value,
+            alpha,
+            now,
+        )?
+    };
+
+    emit!(ForcedDeleverage {
+        winner: accounts.winner.key(),
+        loser: accounts.loser.key(),
+        market_id,
+        size_to_winner,
+        alpha_raw,
+        loss_atoms: loss,
+    });
+    Ok(())
+}
+
+/// Raw portfolio value in settlement atoms: collateral converted once, plus
+/// each settlement balance and mark-to-market position. Haircuts stay in the
+/// health ratio and do not change this debt figure.
+fn portfolio_settlement_value<'info, const N: usize>(
+    subaccount: &Subaccount,
+    observations: &ObservationSet<'info, N>,
+    now: i64,
+) -> Result<i128> {
+    let mut total = subaccount.collateral_balance_atoms;
+    for slot in &subaccount.markets {
+        if slot.market_id == 0 {
+            continue;
+        }
+        total = total
+            .checked_add(slot.settlement_balance_atoms)
+            .ok_or_else(|| error!(StateError::ArithmeticOverflow))?;
+        let entry = market_observation_for(observations, slot.market_id)?;
+        let position_value = {
+            let market = entry.loader.load()?;
+            let time_to_maturity = market
+                .config
+                .maturity_timestamp
+                .checked_sub(now)
+                .ok_or(StateError::InvalidClock)?;
+            if time_to_maturity < 0 {
+                return Err(error!(StateError::InvalidClock));
+            }
+            let mark = market.current_mark_rate(now)?;
+            market.position_value(slot.position_size, mark, time_to_maturity)?
+        };
+        // The fixed quote already expresses value in settlement units.
+        total = total
+            .checked_add(position_value)
+            .ok_or_else(|| error!(StateError::ArithmeticOverflow))?;
+    }
+    Ok(total)
+}
