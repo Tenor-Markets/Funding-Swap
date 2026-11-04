@@ -136,26 +136,29 @@ impl GlobalGovernanceConfig {
     }
 }
 
+/// One atomic authority rotation: the category to change and its new key.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default)]
+pub struct AuthorityUpdate {
+    pub category: u8,
+    pub authority: Pubkey,
+}
+
 /// None leaves the live field unchanged. Authority rotation is limited to one
 /// category per call; fee settings can be updated in the same atomic call.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, Default)]
 pub struct UpdateAuthoritiesArgs {
-    pub target_category: Option<u8>,
-    pub new_authority: Option<Pubkey>,
+    pub authority_update: Option<AuthorityUpdate>,
     pub subaccount_creation_fee_lamports: Option<u64>,
     pub subaccount_creation_fee_destination: Option<Pubkey>,
 }
 
 impl UpdateAuthoritiesArgs {
     pub fn apply(&self, config: &mut GlobalGovernanceConfig) -> StateResult<()> {
-        if self.target_category.is_some() != self.new_authority.is_some() {
-            return Err(StateError::IncompleteAuthorityUpdate);
-        }
-
         let mut next = *config;
 
-        if let (Some(category), Some(authority)) = (self.target_category, self.new_authority) {
-            next.authorities[GovernanceCategory::try_from(category)?.index()] = authority;
+        if let Some(update) = self.authority_update {
+            next.authorities[GovernanceCategory::try_from(update.category)?.index()] =
+                update.authority;
         }
 
         if let Some(value) = self.subaccount_creation_fee_lamports {

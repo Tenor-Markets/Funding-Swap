@@ -275,14 +275,12 @@ pub enum FundingSwapError {
     InvalidGovernanceAuthority = 133,
     #[msg("The creation-fee destination must match the configured nonzero public key.")]
     InvalidCreationFeeDestination,
-    #[msg("Authority rotation requires both a category and its replacement authority.")]
-    IncompleteAuthorityUpdate,
     #[msg("Critical health ratio must be positive and cancellation ratio must be at least critical health ratio.")]
-    InvalidGroupHealthRatios,
+    InvalidGroupHealthRatios = 136,
     #[msg("The market must be finalized as matured before this operation.")]
-    MarketNotMatured,
+    MarketNotMatured = 137,
     #[msg("This operation must occur before the market maturity timestamp.")]
-    MarketExpired,
+    MarketExpired = 138,
 
     #[msg("The market funding source must be seeded before this operation.")]
     MarketSourceNotSeeded = 140,

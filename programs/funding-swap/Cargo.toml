@@ -19,6 +19,7 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "funding-swap-math
 anchor-debug = []
 custom-heap = []
 custom-panic = []
+test-helpers = []
 
 [dependencies]
 anchor-lang = "=1.0.2"
@@ -31,8 +32,11 @@ funding-swap-math = { path = "../../crates/funding-swap-math" }
 pyth-solana-receiver-sdk = "2.0.0"
 
 [dev-dependencies]
+anyhow = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+litesvm = "0.12"
 proptest = "1"
+solana-sdk = "3.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
