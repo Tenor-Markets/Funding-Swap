@@ -1,6 +1,8 @@
 #![cfg(feature = "test-helpers")]
 
-use funding_swap::state::{AuthorityUpdate, GovernanceCategory, StateError, UpdateAuthoritiesArgs};
+use funding_swap::state::{
+    AuthorityUpdate, GovernanceCategory, StateError, UpdateAuthoritiesArgs, GOVERNANCE_CATEGORIES,
+};
 use solana_sdk::{signature::Keypair, signer::Signer};
 
 mod common;
@@ -15,7 +17,9 @@ use common::{
 fn test_update_authorities_succeeds_for_authority_administrator() {
     let mut svm = new_svm().expect("svm");
 
-    let (authority, governance) = setup_governance(&mut svm).expect("governance setup");
+    let setup = setup_governance(&mut svm).expect("governance setup");
+    let governance = setup.governance;
+    let authority = setup.authority(GovernanceCategory::AuthorityAdministration);
     let before = read_governance(&svm, governance).expect("read governance");
 
     let new_risk_authority = Keypair::new().pubkey();
@@ -32,7 +36,7 @@ fn test_update_authorities_succeeds_for_authority_administrator() {
 
     let ix = update_authorities_instruction(authority.pubkey(), args.clone());
 
-    assert_transaction_success(send_tx(&mut svm, &authority, vec![ix], &[]));
+    assert_transaction_success(send_tx(&mut svm, authority, vec![ix], &[]));
 
     assert_governance_updated(&svm, governance, before, &args);
 }
@@ -67,7 +71,8 @@ fn test_update_authorities_fails_when_signer_is_not_authority_administrator() {
 fn test_update_authorities_fails_when_authority_does_not_sign() {
     let mut svm = new_svm().expect("svm");
 
-    let (authority, _) = setup_governance(&mut svm).expect("governance setup");
+    let setup = setup_governance(&mut svm).expect("governance setup");
+    let authority = setup.authority(GovernanceCategory::AuthorityAdministration);
     let payer = airdrop_keypair(&mut svm);
 
     let args = UpdateAuthoritiesArgs {
@@ -90,7 +95,9 @@ fn test_update_authorities_fails_when_authority_does_not_sign() {
 fn test_update_authorities_rotates_authority_administrator_and_revokes_old_signer() {
     let mut svm = new_svm().expect("svm");
 
-    let (authority, governance) = setup_governance(&mut svm).expect("governance setup");
+    let setup = setup_governance(&mut svm).expect("governance setup");
+    let governance = setup.governance;
+    let authority = setup.authority(GovernanceCategory::AuthorityAdministration);
     let before = read_governance(&svm, governance).expect("read governance");
 
     let new_administrator = Keypair::new().pubkey();
@@ -106,7 +113,7 @@ fn test_update_authorities_rotates_authority_administrator_and_revokes_old_signe
 
     let ix = update_authorities_instruction(authority.pubkey(), args.clone());
 
-    assert_transaction_success(send_tx(&mut svm, &authority, vec![ix], &[]));
+    assert_transaction_success(send_tx(&mut svm, authority, vec![ix], &[]));
 
     assert_governance_updated(&svm, governance, before, &args);
 
@@ -122,7 +129,7 @@ fn test_update_authorities_rotates_authority_administrator_and_revokes_old_signe
     let stale_ix = update_authorities_instruction(authority.pubkey(), stale_args);
 
     assert_instruction_error(
-        send_tx(&mut svm, &authority, vec![stale_ix], &[]),
+        send_tx(&mut svm, authority, vec![stale_ix], &[]),
         0,
         u32::from(StateError::InvalidAuthority),
     );
@@ -132,11 +139,12 @@ fn test_update_authorities_rotates_authority_administrator_and_revokes_old_signe
 fn test_update_authorities_fails_for_unknown_category() {
     let mut svm = new_svm().expect("svm");
 
-    let (authority, _) = setup_governance(&mut svm).expect("governance setup");
+    let setup = setup_governance(&mut svm).expect("governance setup");
+    let authority = setup.authority(GovernanceCategory::AuthorityAdministration);
 
     let args = UpdateAuthoritiesArgs {
         authority_update: Some(AuthorityUpdate {
-            category: 8,
+            category: GOVERNANCE_CATEGORIES as u8,
             authority: Keypair::new().pubkey(),
         }),
         subaccount_creation_fee_lamports: None,
@@ -146,7 +154,7 @@ fn test_update_authorities_fails_for_unknown_category() {
     let ix = update_authorities_instruction(authority.pubkey(), args);
 
     assert_instruction_error(
-        send_tx(&mut svm, &authority, vec![ix], &[]),
+        send_tx(&mut svm, authority, vec![ix], &[]),
         0,
         u32::from(StateError::InvalidGovernanceCategory),
     );

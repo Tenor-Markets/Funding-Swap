@@ -5,10 +5,14 @@ use std::path::Path;
 
 use anchor_lang::{system_program, InstructionData};
 use anyhow::{anyhow, Context, Result};
+use fixed::types::I64F64;
 use funding_swap::{
     instruction,
-    state::{AuthorityUpdate, GlobalGovernanceConfig, GovernanceCategory},
-    GovernanceInitializationArgs, ID as FUNDING_SWAP_PROGRAM_ID,
+    state::{
+        AuthorityUpdate, GlobalGovernanceConfig, GovernanceCategory, MarginGroup,
+        UpdateGroupRiskArgs, GOVERNANCE_CATEGORIES, GROUP_PENDING,
+    },
+    CreateMarginGroupArgs, GovernanceInitializationArgs, ID as FUNDING_SWAP_PROGRAM_ID,
 };
 use litesvm::{types::TransactionResult, LiteSVM};
 use solana_sdk::{
@@ -181,31 +185,384 @@ pub fn setup_upgrade_authority(svm: &mut LiteSVM) -> Result<Keypair> {
     Ok(authority)
 }
 
-pub fn setup_governance(svm: &mut LiteSVM) -> Result<(Keypair, Pubkey)> {
-    let authority = Keypair::new();
+pub struct GovernanceSetup {
+    pub governance: Pubkey,
+    pub authorities: [Keypair; GOVERNANCE_CATEGORIES],
+}
 
-    airdrop(svm, &authority);
-    set_program_upgrade_authority(svm, authority.pubkey())?;
+impl GovernanceSetup {
+    pub fn authority(&self, category: GovernanceCategory) -> &Keypair {
+        &self.authorities[category.index()]
+    }
+
+    pub fn authority_key(&self, category: GovernanceCategory) -> Pubkey {
+        self.authority(category).pubkey()
+    }
+}
+
+pub fn setup_governance(svm: &mut LiteSVM) -> Result<GovernanceSetup> {
+    let upgrade_authority = airdrop_keypair(svm);
+
+    set_program_upgrade_authority(svm, upgrade_authority.pubkey())?;
+
+    let mut authorities: [Keypair; GOVERNANCE_CATEGORIES] =
+        core::array::from_fn(|_| airdrop_keypair(svm));
+
+    authorities[GovernanceCategory::AuthorityAdministration.index()] = upgrade_authority;
 
     let governance = governance_address();
+    let initializer = &authorities[GovernanceCategory::AuthorityAdministration.index()];
 
     let args = GovernanceInitializationArgs {
-        authorities: default_authorities(authority.pubkey()),
+        authorities: core::array::from_fn(|index| authorities[index].pubkey()),
         subaccount_creation_fee_lamports: 0,
         subaccount_creation_fee_destination: Pubkey::new_unique(),
     };
 
-    let ix = initialize_governance_instruction(authority.pubkey(), args);
+    let ix = initialize_governance_instruction(initializer.pubkey(), args);
 
-    assert_transaction_success(send_tx(svm, &authority, vec![ix], &[]));
+    assert_transaction_success(send_tx(svm, initializer, vec![ix], &[]));
 
-    Ok((authority, governance))
+    Ok(GovernanceSetup {
+        governance,
+        authorities,
+    })
 }
 
 pub fn authority_update(category: GovernanceCategory, authority: Pubkey) -> AuthorityUpdate {
     AuthorityUpdate {
         category: category.as_u8(),
         authority,
+    }
+}
+
+pub fn fixed_raw(numerator: i128, denominator: i128) -> i128 {
+    assert!(denominator > 0, "denominator must be positive");
+
+    (numerator << I64F64::FRAC_NBITS) / denominator
+}
+
+pub fn margin_group_address(group_id: u16) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"margin_group", &group_id.to_le_bytes()],
+        &FUNDING_SWAP_PROGRAM_ID,
+    )
+    .0
+}
+
+pub fn read_margin_group(svm: &LiteSVM, margin_group: Pubkey) -> Result<MarginGroup> {
+    let account = svm
+        .get_account(&margin_group)
+        .ok_or_else(|| anyhow!("margin group account not found"))?;
+
+    let data = account
+        .data
+        .get(8..)
+        .ok_or_else(|| anyhow!("margin group account is smaller than its discriminator"))?;
+
+    Ok(bytemuck::pod_read_unaligned::<MarginGroup>(data))
+}
+
+pub fn create_margin_group_args(
+    group_id: u16,
+    critical_health_ratio_raw: i128,
+    risky_order_cancellation_ratio_raw: i128,
+) -> CreateMarginGroupArgs {
+    CreateMarginGroupArgs {
+        group_id,
+        critical_health_ratio_raw,
+        risky_order_cancellation_ratio_raw,
+    }
+}
+
+pub fn create_margin_group_instruction(
+    authority: Pubkey,
+    args: CreateMarginGroupArgs,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new_readonly(governance_address(), false),
+            AccountMeta::new(margin_group_address(args.group_id), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: instruction::CreateMarginGroup { args }.data(),
+    }
+}
+
+fn margin_group_action_instruction(
+    authority: Pubkey,
+    margin_group: Pubkey,
+    data: Vec<u8>,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new_readonly(governance_address(), false),
+            AccountMeta::new(margin_group, false),
+        ],
+        data,
+    }
+}
+
+pub fn activate_margin_group_instruction(authority: Pubkey, margin_group: Pubkey) -> Instruction {
+    margin_group_action_instruction(
+        authority,
+        margin_group,
+        instruction::ActivateMarginGroup {}.data(),
+    )
+}
+
+pub fn pause_margin_group_instruction(authority: Pubkey, margin_group: Pubkey) -> Instruction {
+    margin_group_action_instruction(
+        authority,
+        margin_group,
+        instruction::PauseMarginGroup {}.data(),
+    )
+}
+
+pub fn resume_margin_group_instruction(authority: Pubkey, margin_group: Pubkey) -> Instruction {
+    margin_group_action_instruction(
+        authority,
+        margin_group,
+        instruction::ResumeMarginGroup {}.data(),
+    )
+}
+
+pub fn tighten_group_risk_instruction(
+    authority: Pubkey,
+    margin_group: Pubkey,
+    args: UpdateGroupRiskArgs,
+) -> Instruction {
+    margin_group_action_instruction(
+        authority,
+        margin_group,
+        instruction::TightenGroupRisk { args }.data(),
+    )
+}
+
+pub fn relax_group_risk_instruction(
+    authority: Pubkey,
+    margin_group: Pubkey,
+    args: UpdateGroupRiskArgs,
+) -> Instruction {
+    margin_group_action_instruction(
+        authority,
+        margin_group,
+        instruction::RelaxGroupRisk { args }.data(),
+    )
+}
+
+pub fn close_margin_group_instruction(
+    authority: Pubkey,
+    margin_group: Pubkey,
+    rent_recipient: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new_readonly(governance_address(), false),
+            AccountMeta::new(margin_group, false),
+            AccountMeta::new(rent_recipient, false),
+        ],
+        data: instruction::CloseMarginGroup {}.data(),
+    }
+}
+
+pub fn group_risk_args(
+    critical_health_ratio_raw: Option<i128>,
+    risky_order_cancellation_ratio_raw: Option<i128>,
+) -> UpdateGroupRiskArgs {
+    UpdateGroupRiskArgs {
+        critical_health_ratio_raw,
+        risky_order_cancellation_ratio_raw,
+    }
+}
+
+pub fn create_margin_group_result(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    args: CreateMarginGroupArgs,
+) -> TransactionResult {
+    let authority = setup.authority(GovernanceCategory::Resources);
+    let ix = create_margin_group_instruction(authority.pubkey(), args);
+
+    send_tx(svm, authority, vec![ix], &[])
+}
+
+pub fn create_margin_group(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    group_id: u16,
+    critical_health_ratio_raw: i128,
+    risky_order_cancellation_ratio_raw: i128,
+) -> Result<Pubkey> {
+    let args = create_margin_group_args(
+        group_id,
+        critical_health_ratio_raw,
+        risky_order_cancellation_ratio_raw,
+    );
+
+    assert_transaction_success(create_margin_group_result(svm, setup, args));
+
+    Ok(margin_group_address(group_id))
+}
+
+pub fn activate_margin_group(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    margin_group: Pubkey,
+) -> Result<()> {
+    let authority = setup.authority(GovernanceCategory::Resources);
+    let ix = activate_margin_group_instruction(authority.pubkey(), margin_group);
+
+    assert_transaction_success(send_tx(svm, authority, vec![ix], &[]));
+
+    Ok(())
+}
+
+pub fn pause_margin_group(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    margin_group: Pubkey,
+) -> Result<()> {
+    let authority = setup.authority(GovernanceCategory::Emergency);
+    let ix = pause_margin_group_instruction(authority.pubkey(), margin_group);
+
+    assert_transaction_success(send_tx(svm, authority, vec![ix], &[]));
+
+    Ok(())
+}
+
+pub fn resume_margin_group(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    margin_group: Pubkey,
+) -> Result<()> {
+    let authority = setup.authority(GovernanceCategory::RiskRecovery);
+    let ix = resume_margin_group_instruction(authority.pubkey(), margin_group);
+
+    assert_transaction_success(send_tx(svm, authority, vec![ix], &[]));
+
+    Ok(())
+}
+
+pub fn setup_active_margin_group(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    group_id: u16,
+    critical_health_ratio_raw: i128,
+    risky_order_cancellation_ratio_raw: i128,
+) -> Result<Pubkey> {
+    let margin_group = create_margin_group(
+        svm,
+        setup,
+        group_id,
+        critical_health_ratio_raw,
+        risky_order_cancellation_ratio_raw,
+    )?;
+
+    activate_margin_group(svm, setup, margin_group)?;
+
+    Ok(margin_group)
+}
+
+pub fn set_margin_group_counts(
+    svm: &mut LiteSVM,
+    margin_group: Pubkey,
+    market_count: u32,
+    subaccount_count: u32,
+) -> Result<()> {
+    let mut account = svm
+        .get_account(&margin_group)
+        .ok_or_else(|| anyhow!("margin group account not found"))?;
+
+    let mut data = read_margin_group(svm, margin_group)?;
+
+    data.market_count = market_count;
+    data.subaccount_count = subaccount_count;
+
+    account
+        .data
+        .get_mut(8..)
+        .ok_or_else(|| anyhow!("margin group account is smaller than its discriminator"))?
+        .copy_from_slice(bytemuck::bytes_of(&data));
+
+    svm.set_account(margin_group, account)
+        .context("patch margin group counts")?;
+
+    Ok(())
+}
+
+pub fn assert_margin_group_status(svm: &LiteSVM, margin_group: Pubkey, expected_status: u8) {
+    let margin_group = read_margin_group(svm, margin_group).expect("read margin group");
+
+    assert_eq!(margin_group.status, expected_status);
+}
+
+pub fn assert_margin_group_health_ratios(
+    svm: &LiteSVM,
+    margin_group: Pubkey,
+    expected_critical_health_ratio_raw: i128,
+    expected_risky_order_cancellation_ratio_raw: i128,
+) {
+    let margin_group = read_margin_group(svm, margin_group).expect("read margin group");
+
+    let critical_health_ratio = margin_group.critical_health_ratio.to_raw_bits();
+    let risky_order_cancellation_ratio = margin_group.risky_order_cancellation_ratio.to_raw_bits();
+
+    assert_eq!(critical_health_ratio, expected_critical_health_ratio_raw);
+    assert_eq!(
+        risky_order_cancellation_ratio,
+        expected_risky_order_cancellation_ratio_raw
+    );
+    assert!(critical_health_ratio > 0);
+    assert!(risky_order_cancellation_ratio >= critical_health_ratio);
+}
+
+pub fn assert_margin_group_counts(
+    svm: &LiteSVM,
+    margin_group: Pubkey,
+    expected_market_count: u32,
+    expected_subaccount_count: u32,
+) {
+    let margin_group = read_margin_group(svm, margin_group).expect("read margin group");
+
+    assert_eq!(margin_group.market_count, expected_market_count);
+    assert_eq!(margin_group.subaccount_count, expected_subaccount_count);
+}
+
+pub fn assert_margin_group_created(
+    svm: &LiteSVM,
+    margin_group: Pubkey,
+    group_id: u16,
+    critical_health_ratio_raw: i128,
+    risky_order_cancellation_ratio_raw: i128,
+) {
+    assert_margin_group_status(svm, margin_group, GROUP_PENDING);
+    assert_margin_group_health_ratios(
+        svm,
+        margin_group,
+        critical_health_ratio_raw,
+        risky_order_cancellation_ratio_raw,
+    );
+    assert_margin_group_counts(svm, margin_group, 0, 0);
+
+    assert_eq!(
+        read_margin_group(svm, margin_group)
+            .expect("read margin group")
+            .group_id,
+        group_id
+    );
+}
+
+pub fn assert_margin_group_closed(svm: &LiteSVM, margin_group: Pubkey) {
+    if let Some(account) = svm.get_account(&margin_group) {
+        assert_eq!(account.lamports, 0);
+        assert!(account.data.is_empty());
     }
 }
 
@@ -267,7 +624,11 @@ pub fn send_without_signer(
 
 #[track_caller]
 pub fn assert_account_not_signer(result: TransactionResult, instruction_index: u8) {
-    assert_program_error(result, instruction_index, InstructionError::Custom(3010));
+    assert_program_error(
+        result,
+        instruction_index,
+        InstructionError::Custom(u32::from(anchor_lang::error::ErrorCode::AccountNotSigner)),
+    );
 }
 
 #[track_caller]
