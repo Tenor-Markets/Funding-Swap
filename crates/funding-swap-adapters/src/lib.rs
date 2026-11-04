@@ -37,11 +37,13 @@ pub(crate) fn validate_observation_timestamps(
     if context.protocol_now < 0 {
         return Err(AdapterError::InvalidClock);
     }
+
     if context.previous_protocol_checkpoint_at < 0
         || context.previous_protocol_checkpoint_at > context.protocol_now
     {
         return Err(AdapterError::InvalidProtocolCheckpointTimestamp);
     }
+
     if source_last_update < 0 || source_last_update > context.protocol_now {
         return Err(AdapterError::InvalidSourceAnchor);
     }
@@ -53,6 +55,7 @@ pub(crate) fn validate_observation_timestamps(
             .ok_or(AdapterError::ArithmeticOverflow)?,
     )
     .map_err(|_| AdapterError::ArithmeticOverflow)?;
+
     if source_age > limits.max_source_age_seconds {
         return Err(AdapterError::SourceTooOld);
     }

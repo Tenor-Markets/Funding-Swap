@@ -359,7 +359,7 @@ pub fn handle_seed_market_source<'info>(
         source_timestamp,
         epoch,
         now,
-    )?;
+    );
 
     Ok(())
 }

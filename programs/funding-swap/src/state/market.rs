@@ -1309,15 +1309,13 @@ impl MarketState {
     /// Initializes a fresh market and its embedded book from validated configuration.
     pub fn initialize_in_place(
         &mut self,
-        mut config: MarketConfig,
+        config: MarketConfig,
         now: i64,
         tick_step: u8,
         minimum_order_size_atoms: u64,
         maximum_order_size_atoms: u64,
         maximum_open_orders_per_subaccount: u8,
     ) -> StateResult<()> {
-        config.zero_opaque_bytes()?;
-        config.validate()?;
 
         if now < 0 {
             return Err(StateError::InvalidClock);
@@ -1331,8 +1329,7 @@ impl MarketState {
         )?;
 
         let one = FixedPoint::from_raw_bits(1i128 << 64);
-        // A whole-market assignment creates a large SBF stack temporary.
-        // Exhaustive destructuring retains field coverage while writing in place.
+
         let Self {
             config: stored_config,
             floating_index: stored_floating_index,
@@ -1598,14 +1595,12 @@ impl MarketState {
         source_last_update_timestamp: i64,
         checkpoint_epoch: u64,
         now: i64,
-    ) -> StateResult<()> {
+    ) {
         self.source_native_checkpoint = source_checkpoint;
         self.source_last_update_timestamp = source_last_update_timestamp;
         self.protocol_checkpoint_timestamp = now;
         self.checkpoint_epoch = checkpoint_epoch;
         self.source_seeded = 1;
-
-        Ok(())
     }
 
     /// Validates one caller-provided placement against market, time, size, and rate bounds.

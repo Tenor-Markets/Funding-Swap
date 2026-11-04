@@ -112,14 +112,17 @@ pub fn validate_source(
     if account.account.key != config.custody {
         return Err(AdapterError::InvalidAccountKey);
     }
+
     if account.account.owner != JUPITER_PROGRAM_ID {
         return Err(AdapterError::InvalidAccountOwner);
     }
 
     let custody = decode_custody(config.layout, account.account.data)?;
+
     if custody.pool != config.pool {
         return Err(AdapterError::InvalidPool);
     }
+
     if custody.mint != config.mint {
         return Err(AdapterError::InvalidMint);
     }
@@ -165,6 +168,7 @@ pub fn seed_observation(
     protocol_now: i64,
 ) -> Result<JupiterSeedObservation, AdapterError> {
     let source = validate_source(config, account)?;
+
     validate_observation_timestamps(
         ObservationContext {
             previous_source_checkpoint: 0,
@@ -174,6 +178,7 @@ pub fn seed_observation(
         source.custody.funding_rate_state.last_update,
         config.limits,
     )?;
+
     Ok(JupiterSeedObservation {
         source_checkpoint: effective_checkpoint(source.custody, protocol_now)?,
         source_last_update_timestamp: source.custody.funding_rate_state.last_update,
@@ -185,6 +190,7 @@ pub fn effective_checkpoint(
     protocol_now: i64,
 ) -> Result<u128, AdapterError> {
     let state = custody.funding_rate_state;
+
     if protocol_now <= state.last_update {
         return Ok(state.cumulative_interest_rate);
     }
@@ -350,6 +356,7 @@ fn decode_custody(
     data: &[u8],
 ) -> Result<JupiterCustody, AdapterError> {
     require_layout(data)?;
+
     Ok(JupiterCustody {
         pool: read_pubkey(data, POOL_OFFSET)?,
         mint: read_pubkey(data, MINT_OFFSET)?,
@@ -378,9 +385,11 @@ fn require_layout(data: &[u8]) -> Result<(), AdapterError> {
     if data.len() != JUPITER_CUSTODY_ACCOUNT_LEN {
         return Err(AdapterError::InvalidAccountLength);
     }
+
     if data.get(..8) != Some(JUPITER_CUSTODY_DISCRIMINATOR.as_slice()) {
         return Err(AdapterError::InvalidDiscriminator);
     }
+
     Ok(())
 }
 
