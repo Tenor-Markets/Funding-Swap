@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 #![allow(clippy::result_large_err)]
 
+use std::mem::offset_of;
 use std::path::Path;
 
 use anchor_lang::{system_program, InstructionData};
@@ -8,14 +9,23 @@ use anyhow::{anyhow, Context, Result};
 use fixed::types::I64F64;
 use funding_swap::{
     instruction,
+    state::market::MARKET_U128_PADDING,
     state::{
-        AuthorityUpdate, GlobalGovernanceConfig, GovernanceCategory, MarginGroup,
-        UpdateGroupRiskArgs, GOVERNANCE_CATEGORIES, GROUP_PENDING,
+        AuthorityUpdate, FixedPoint, GlobalGovernanceConfig, GovernanceCategory, MarginGroup,
+        MarketConfig, MarketState, UpdateFeesAndLiquidationArgs, UpdateGroupRiskArgs,
+        UpdateMarketRiskArgs, GOVERNANCE_CATEGORIES, GROUP_PENDING, MARKET_PENDING,
     },
-    CreateMarginGroupArgs, GovernanceInitializationArgs, ID as FUNDING_SWAP_PROGRAM_ID,
+    CreateMarginGroupArgs, CreateMarketArgs, GovernanceInitializationArgs, MarketAdapterArgs,
+    ID as FUNDING_SWAP_PROGRAM_ID,
+};
+use funding_swap_adapters::{
+    jupiter::JUPITER_PROGRAM_ID,
+    phoenix::{PHOENIX_GLOBAL_CONFIGURATION, PHOENIX_PERP_ASSET_MAP, PHOENIX_PROGRAM_ID},
 };
 use litesvm::{types::TransactionResult, LiteSVM};
 use solana_sdk::{
+    account::Account,
+    clock::Clock,
     instruction::{AccountMeta, Instruction, InstructionError},
     pubkey::Pubkey,
     signature::Keypair,
@@ -564,6 +574,660 @@ pub fn assert_margin_group_closed(svm: &LiteSVM, margin_group: Pubkey) {
         assert_eq!(account.lamports, 0);
         assert!(account.data.is_empty());
     }
+}
+
+pub const JUPITER_SOL_CUSTODY: Pubkey =
+    solana_sdk::pubkey!("7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz");
+pub const JUPITER_POOL: Pubkey =
+    solana_sdk::pubkey!("5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq");
+pub const JUPITER_SOL_MINT: Pubkey =
+    solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
+
+// Jupiter SOL custody captured from mainnet at slot 436_948_909
+// (2026-08-03T09:54:17Z).
+pub const JUPITER_FIXTURE_SLOT: u64 = 436_948_909;
+pub const JUPITER_FIXTURE_LAST_UPDATE: i64 = 1_785_750_857;
+pub const JUPITER_FIXTURE_CHECKPOINT: u128 = 1_044_371_865;
+
+pub fn jupiter_sol_custody_fixture() -> Vec<u8> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    STANDARD
+        .decode(include_str!("../fixtures/jupiter/sol.base64").trim())
+        .expect("decode Jupiter SOL fixture")
+}
+
+// Phoenix/Rise global configuration and perp asset map captured from mainnet
+// at slot 436_979_123 (1_785_763_629, 2026-08-03T13:27:09Z).
+pub const PHOENIX_FIXTURE_SLOT: u64 = 436_979_123;
+pub const PHOENIX_FIXTURE_LAST_UPDATE: i64 = 1_785_763_629;
+pub const PHOENIX_FIXTURE_CHECKPOINT: u128 = 2_190;
+
+pub const PHOENIX_SOL_MARKET: Pubkey =
+    solana_sdk::pubkey!("71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2");
+pub const PHOENIX_SOL_SYMBOL: [u8; 16] = [b'S', b'O', b'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+pub fn phoenix_global_fixture() -> Vec<u8> {
+    include_bytes!("../fixtures/phoenix/global_configuration.bin").to_vec()
+}
+
+pub fn phoenix_asset_map_fixture() -> Vec<u8> {
+    include_bytes!("../fixtures/phoenix/perp_asset_map.bin").to_vec()
+}
+
+pub fn set_phoenix_source_accounts(svm: &mut LiteSVM) -> Result<()> {
+    for (key, data) in [
+        (PHOENIX_GLOBAL_CONFIGURATION, phoenix_global_fixture()),
+        (PHOENIX_PERP_ASSET_MAP, phoenix_asset_map_fixture()),
+    ] {
+        let lamports = svm.minimum_balance_for_rent_exemption(data.len());
+
+        svm.set_account(
+            key,
+            Account {
+                lamports,
+                data,
+                owner: PHOENIX_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .context("set Phoenix source fixture")?;
+    }
+
+    Ok(())
+}
+
+pub fn phoenix_sol_market_adapter() -> MarketAdapterArgs {
+    MarketAdapterArgs::Phoenix {
+        max_abs_native_delta: 10_000,
+        global_configuration: PHOENIX_GLOBAL_CONFIGURATION,
+        perp_asset_map: PHOENIX_PERP_ASSET_MAP,
+        market_account: PHOENIX_SOL_MARKET,
+        tick_size: 100,
+        funding_interval_seconds: 3_600,
+        funding_period_seconds: 86_400,
+        max_funding_age_seconds: 3_600,
+        max_mark_age_slots: 100,
+        symbol: PHOENIX_SOL_SYMBOL,
+        asset_slot: 0,
+        asset_id: 0,
+        base_lot_decimals: 2,
+    }
+}
+
+pub fn phoenix_sol_market_args() -> CreateMarketArgs {
+    let mut args = default_market_args_with_adapter(phoenix_sol_market_adapter());
+
+    args.underlying_decimals = 9;
+    args.tick_scale = 9;
+    args.start_timestamp = PHOENIX_FIXTURE_LAST_UPDATE + 3_600;
+    args.maturity_timestamp = args.start_timestamp + 31_536_000;
+
+    args
+}
+
+pub fn phoenix_seed_market_source_instruction(market: Pubkey) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(PHOENIX_GLOBAL_CONFIGURATION, false),
+            AccountMeta::new_readonly(PHOENIX_PERP_ASSET_MAP, false),
+        ],
+        data: instruction::SeedMarketSource {}.data(),
+    }
+}
+
+pub fn create_uninitialized_market_account(svm: &mut LiteSVM) -> Result<Pubkey> {
+    let market = Pubkey::new_unique();
+    let data = vec![0u8; MarketState::SPACE];
+    let lamports = svm.minimum_balance_for_rent_exemption(data.len());
+
+    svm.set_account(
+        market,
+        Account {
+            lamports,
+            data,
+            owner: FUNDING_SWAP_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .context("create zeroed market account")?;
+
+    Ok(market)
+}
+
+pub fn read_market_config(svm: &LiteSVM, market: Pubkey) -> Result<MarketConfig> {
+    let account = svm
+        .get_account(&market)
+        .ok_or_else(|| anyhow!("market account not found"))?;
+
+    let start = 8 + offset_of!(MarketState, config);
+    let end = start + core::mem::size_of::<MarketConfig>();
+
+    Ok(bytemuck::pod_read_unaligned::<MarketConfig>(
+        &account.data[start..end],
+    ))
+}
+
+/// `offset_of!` reflects the host's 16-byte `u128` alignment. `MarketState`
+/// carries host-only padding before its first post-timestamp `u128`, so every
+/// field after that point is `MARKET_U128_PADDING` bytes later on the host.
+fn persisted_tail_offset(field_offset: usize) -> usize {
+    field_offset - MARKET_U128_PADDING
+}
+
+pub fn read_market_status(svm: &LiteSVM, market: Pubkey) -> Result<u8> {
+    let account = svm
+        .get_account(&market)
+        .ok_or_else(|| anyhow!("market account not found"))?;
+
+    let offset = 8 + persisted_tail_offset(offset_of!(MarketState, status));
+
+    Ok(account.data[offset])
+}
+
+pub fn read_market_source(svm: &LiteSVM, market: Pubkey) -> Result<(u128, i64, bool)> {
+    let account = svm
+        .get_account(&market)
+        .ok_or_else(|| anyhow!("market account not found"))?;
+
+    let checkpoint_offset = 8 + offset_of!(MarketState, source_native_checkpoint);
+    let timestamp_offset = 8 + offset_of!(MarketState, source_last_update_timestamp);
+    let seeded_offset = 8 + persisted_tail_offset(offset_of!(MarketState, source_seeded));
+
+    let checkpoint = u128::from_le_bytes(
+        account.data[checkpoint_offset..checkpoint_offset + 16]
+            .try_into()
+            .expect("checkpoint bytes"),
+    );
+    let timestamp = i64::from_le_bytes(
+        account.data[timestamp_offset..timestamp_offset + 8]
+            .try_into()
+            .expect("source timestamp bytes"),
+    );
+
+    Ok((checkpoint, timestamp, account.data[seeded_offset] == 1))
+}
+
+pub fn set_market_status(svm: &mut LiteSVM, market: Pubkey, status: u8) -> Result<()> {
+    let mut account = svm
+        .get_account(&market)
+        .ok_or_else(|| anyhow!("market account not found"))?;
+
+    let offset = 8 + persisted_tail_offset(offset_of!(MarketState, status));
+
+    account.data[offset] = status;
+
+    svm.set_account(market, account)
+        .context("patch market status")?;
+
+    Ok(())
+}
+
+pub fn set_market_source_seeded(svm: &mut LiteSVM, market: Pubkey, seeded: bool) -> Result<()> {
+    let mut account = svm
+        .get_account(&market)
+        .ok_or_else(|| anyhow!("market account not found"))?;
+
+    let offset = 8 + persisted_tail_offset(offset_of!(MarketState, source_seeded));
+
+    account.data[offset] = u8::from(seeded);
+
+    svm.set_account(market, account)
+        .context("patch market source seeded flag")?;
+
+    Ok(())
+}
+
+pub fn set_clock(svm: &mut LiteSVM, unix_timestamp: i64, slot: u64) {
+    svm.set_sysvar(&Clock {
+        slot,
+        unix_timestamp,
+        ..Clock::default()
+    });
+}
+
+pub fn jupiter_market_adapter() -> MarketAdapterArgs {
+    MarketAdapterArgs::Jupiter {
+        max_source_delta: 1_000_000_000_000,
+        custody: Pubkey::new_unique(),
+        pool: Pubkey::new_unique(),
+        mint: Pubkey::new_unique(),
+        max_source_age_seconds: 3_600,
+    }
+}
+
+pub fn jupiter_sol_market_adapter() -> MarketAdapterArgs {
+    MarketAdapterArgs::Jupiter {
+        max_source_delta: 1_000_000_000_000,
+        custody: JUPITER_SOL_CUSTODY,
+        pool: JUPITER_POOL,
+        mint: JUPITER_SOL_MINT,
+        max_source_age_seconds: 3_600,
+    }
+}
+
+pub fn default_market_args_with_adapter(adapter: MarketAdapterArgs) -> CreateMarketArgs {
+    CreateMarketArgs {
+        underlying_decimals: 6,
+        underlying_feed_id: [1; 32],
+        underlying_max_age_seconds: 60,
+        underlying_max_confidence_ratio_raw: fixed_raw(1, 100),
+        underlying_max_ema_deviation_raw: fixed_raw(1, 100),
+        start_timestamp: 100,
+        maturity_timestamp: 10_000,
+        hard_gross_open_interest_cap_atoms: 1_000_000_000,
+        mark_observation_window_seconds: 60,
+        margin_time_threshold_seconds: 60,
+        tick_scale: 6,
+        tick_step: 1,
+        minimum_order_size_atoms: 1,
+        maximum_order_size_atoms: 1_000_000_000,
+        maximum_open_orders_per_subaccount: 32,
+        rate_floor_raw: fixed_raw(1, 100),
+        initial_margin_factor_raw: fixed_raw(1, 5),
+        maintenance_margin_factor_raw: fixed_raw(1, 10),
+        order_rate_bound_factor_raw: fixed_raw(100, 1),
+        closing_margin_relief_bound_factor_raw: fixed_raw(1, 4),
+        trade_mark_update_bound_factor_raw: fixed_raw(100, 1),
+        taker_fee_rate_raw: fixed_raw(1, 1_000),
+        annualized_settlement_fee_rate_raw: fixed_raw(1, 100),
+        liquidation_base_incentive_raw: fixed_raw(1, 100),
+        liquidation_incentive_slope_raw: fixed_raw(1, 100),
+        liquidation_fee_rate_raw: fixed_raw(1, 100),
+        adapter,
+    }
+}
+
+pub fn default_market_args() -> CreateMarketArgs {
+    default_market_args_with_adapter(jupiter_market_adapter())
+}
+
+pub fn jupiter_sol_market_args() -> CreateMarketArgs {
+    let mut args = default_market_args_with_adapter(jupiter_sol_market_adapter());
+
+    args.underlying_decimals = 9;
+    args.tick_scale = 9;
+    args.start_timestamp = JUPITER_FIXTURE_LAST_UPDATE + 3_600;
+    args.maturity_timestamp = args.start_timestamp + 31_536_000;
+
+    args
+}
+
+pub fn initialize_market_instruction(
+    authority: Pubkey,
+    market: Pubkey,
+    args: CreateMarketArgs,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new(governance_address(), false),
+            AccountMeta::new(market, false),
+        ],
+        data: instruction::InitializeMarket { args }.data(),
+    }
+}
+
+pub fn send_initialize_market(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    market: Pubkey,
+    args: CreateMarketArgs,
+) -> TransactionResult {
+    let authority = setup.authority(GovernanceCategory::Resources);
+    let ix = initialize_market_instruction(authority.pubkey(), market, args);
+
+    send_tx(svm, authority, vec![ix], &[])
+}
+
+pub fn initialize_market(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    args: CreateMarketArgs,
+) -> Result<Pubkey> {
+    let market = create_uninitialized_market_account(svm)?;
+
+    assert_transaction_success(send_initialize_market(svm, setup, market, args));
+
+    Ok(market)
+}
+
+pub fn activate_market_instruction(authority: Pubkey, market: Pubkey) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new_readonly(governance_address(), false),
+            AccountMeta::new(market, false),
+        ],
+        data: instruction::ActivateMarket {}.data(),
+    }
+}
+
+pub fn activate_market(svm: &mut LiteSVM, setup: &GovernanceSetup, market: Pubkey) -> Result<()> {
+    let authority = setup.authority(GovernanceCategory::Resources);
+    let ix = activate_market_instruction(authority.pubkey(), market);
+
+    assert_transaction_success(send_tx(svm, authority, vec![ix], &[]));
+
+    Ok(())
+}
+
+pub fn setup_active_market(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    args: CreateMarketArgs,
+) -> Result<Pubkey> {
+    let market = initialize_market(svm, setup, args)?;
+
+    set_market_source_seeded(svm, market, true)?;
+    activate_market(svm, setup, market)?;
+
+    Ok(market)
+}
+
+pub fn market_group_membership_address(margin_group: Pubkey, market: Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"market_group_membership",
+            margin_group.as_ref(),
+            market.as_ref(),
+        ],
+        &FUNDING_SWAP_PROGRAM_ID,
+    )
+    .0
+}
+
+pub fn activate_market_membership_instruction(
+    authority: Pubkey,
+    margin_group: Pubkey,
+    market: Pubkey,
+    membership: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new_readonly(governance_address(), false),
+            AccountMeta::new(margin_group, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(membership, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: instruction::ActivateMarketGroupMembership {}.data(),
+    }
+}
+
+pub fn activate_market_membership(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    margin_group: Pubkey,
+    market: Pubkey,
+) -> Result<Pubkey> {
+    let authority = setup.authority(GovernanceCategory::Resources);
+    let membership = market_group_membership_address(margin_group, market);
+    let ix = activate_market_membership_instruction(
+        authority.pubkey(),
+        margin_group,
+        market,
+        membership,
+    );
+
+    assert_transaction_success(send_tx(svm, authority, vec![ix], &[]));
+
+    Ok(membership)
+}
+
+fn market_governance_instruction(authority: Pubkey, market: Pubkey, data: Vec<u8>) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new_readonly(governance_address(), false),
+            AccountMeta::new(market, false),
+        ],
+        data,
+    }
+}
+
+pub fn tighten_market_risk_instruction(
+    authority: Pubkey,
+    market: Pubkey,
+    args: UpdateMarketRiskArgs,
+) -> Instruction {
+    market_governance_instruction(
+        authority,
+        market,
+        instruction::TightenMarketRisk { args }.data(),
+    )
+}
+
+pub fn relax_market_risk_instruction(
+    authority: Pubkey,
+    market: Pubkey,
+    args: UpdateMarketRiskArgs,
+) -> Instruction {
+    market_governance_instruction(
+        authority,
+        market,
+        instruction::RelaxMarketRisk { args }.data(),
+    )
+}
+
+pub fn update_fees_and_liquidation_instruction(
+    authority: Pubkey,
+    market: Pubkey,
+    args: UpdateFeesAndLiquidationArgs,
+) -> Instruction {
+    market_governance_instruction(
+        authority,
+        market,
+        instruction::UpdateFeesAndLiquidation { args }.data(),
+    )
+}
+
+pub fn restrict_market_status_instruction(
+    authority: Pubkey,
+    market: Pubkey,
+    status: u8,
+) -> Instruction {
+    market_governance_instruction(
+        authority,
+        market,
+        instruction::RestrictMarketStatus { status }.data(),
+    )
+}
+
+pub fn restore_market_status_instruction(
+    authority: Pubkey,
+    market: Pubkey,
+    status: u8,
+) -> Instruction {
+    market_governance_instruction(
+        authority,
+        market,
+        instruction::RestoreMarketStatus { status }.data(),
+    )
+}
+
+pub fn jupiter_seed_market_source_instruction(market: Pubkey) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(JUPITER_SOL_CUSTODY, false),
+        ],
+        data: instruction::SeedMarketSource {}.data(),
+    }
+}
+
+pub fn set_jupiter_sol_custody_account(svm: &mut LiteSVM) -> Result<()> {
+    let data = jupiter_sol_custody_fixture();
+    let lamports = svm.minimum_balance_for_rent_exemption(data.len());
+
+    svm.set_account(
+        JUPITER_SOL_CUSTODY,
+        Account {
+            lamports,
+            data,
+            owner: JUPITER_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .context("set Jupiter SOL custody fixture")?;
+
+    Ok(())
+}
+
+pub fn assert_market_status(svm: &LiteSVM, market: Pubkey, expected_status: u8) {
+    assert_eq!(
+        read_market_status(svm, market).expect("read market status"),
+        expected_status
+    );
+}
+
+pub fn assert_market_initialized(
+    svm: &LiteSVM,
+    governance: Pubkey,
+    market: Pubkey,
+    args: &CreateMarketArgs,
+    expected_market_id: u64,
+) {
+    let config = read_market_config(svm, market).expect("read market config");
+
+    assert_eq!(config.market_id, expected_market_id);
+    assert_eq!(config.start_timestamp, args.start_timestamp);
+    assert_eq!(config.maturity_timestamp, args.maturity_timestamp);
+    assert_eq!(config.underlying_decimals, args.underlying_decimals);
+    assert_eq!(config.tick_scale, args.tick_scale);
+    assert_eq!(
+        config.hard_gross_open_interest_cap_atoms,
+        args.hard_gross_open_interest_cap_atoms
+    );
+    assert_eq!(
+        config.mark_observation_window_seconds,
+        args.mark_observation_window_seconds
+    );
+    assert_eq!(
+        config.margin_time_threshold_seconds,
+        args.margin_time_threshold_seconds
+    );
+    assert_eq!(config.rate_floor.to_raw_bits(), args.rate_floor_raw);
+    assert_eq!(
+        config.initial_margin_factor.to_raw_bits(),
+        args.initial_margin_factor_raw
+    );
+    assert_eq!(
+        config.maintenance_margin_factor.to_raw_bits(),
+        args.maintenance_margin_factor_raw
+    );
+
+    assert_market_status(svm, market, MARKET_PENDING);
+
+    let (_, _, seeded) = read_market_source(svm, market).expect("read market source");
+    assert!(!seeded);
+
+    let governance = read_governance(svm, governance).expect("read governance");
+    assert_eq!(governance.next_market_id, expected_market_id + 1);
+}
+
+pub fn assert_market_risk_updated(
+    svm: &LiteSVM,
+    market: Pubkey,
+    mut expected: MarketConfig,
+    args: &UpdateMarketRiskArgs,
+) {
+    if let Some(value) = args.initial_margin_factor_raw {
+        expected.initial_margin_factor = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.maintenance_margin_factor_raw {
+        expected.maintenance_margin_factor = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.closing_margin_relief_bound_factor_raw {
+        expected.closing_margin_relief_bound_factor = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.rate_floor_raw {
+        let previous_rate_floor = expected.rate_floor;
+
+        expected.rate_floor = FixedPoint::from_raw_bits(value);
+
+        if expected.rate_floor != previous_rate_floor {
+            expected.pm_cache_nonce += 1;
+        }
+    }
+    if let Some(value) = args.hard_gross_open_interest_cap_atoms {
+        expected.hard_gross_open_interest_cap_atoms = value;
+    }
+    if let Some(value) = args.mark_observation_window_seconds {
+        expected.mark_observation_window_seconds = value;
+    }
+    if let Some(value) = args.margin_time_threshold_seconds {
+        expected.margin_time_threshold_seconds = value;
+    }
+    if let Some(value) = args.order_rate_bound_factor_raw {
+        expected.order_rate_bound_factor = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.trade_mark_update_bound_factor_raw {
+        expected.trade_mark_update_bound_factor = FixedPoint::from_raw_bits(value);
+    }
+
+    assert_eq!(
+        read_market_config(svm, market).expect("read market config"),
+        expected
+    );
+}
+
+pub fn assert_market_fees_updated(
+    svm: &LiteSVM,
+    market: Pubkey,
+    mut expected: MarketConfig,
+    args: &UpdateFeesAndLiquidationArgs,
+) {
+    if let Some(value) = args.taker_fee_rate_raw {
+        expected.taker_fee_rate = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.annualized_settlement_fee_rate_raw {
+        expected.annualized_settlement_fee_rate = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.liquidation_base_incentive_raw {
+        expected.liquidation_base_incentive = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.liquidation_incentive_slope_raw {
+        expected.liquidation_incentive_slope = FixedPoint::from_raw_bits(value);
+    }
+    if let Some(value) = args.liquidation_fee_rate_raw {
+        expected.liquidation_fee_rate = FixedPoint::from_raw_bits(value);
+    }
+
+    assert_eq!(
+        read_market_config(svm, market).expect("read market config"),
+        expected
+    );
+}
+
+pub fn assert_market_source_seeded(
+    svm: &LiteSVM,
+    market: Pubkey,
+    expected_checkpoint: u128,
+    expected_timestamp: i64,
+) {
+    let (checkpoint, timestamp, seeded) =
+        read_market_source(svm, market).expect("read market source");
+
+    assert!(seeded);
+    assert_eq!(checkpoint, expected_checkpoint);
+    assert_eq!(timestamp, expected_timestamp);
+}
+
+pub fn assert_account_exists(svm: &LiteSVM, account: Pubkey) {
+    assert!(svm.get_account(&account).is_some());
 }
 
 pub fn assert_governance_initialized(svm: &LiteSVM, expected: &GovernanceInitializationArgs) {

@@ -15,7 +15,8 @@ pub struct ActivateMarketGroupMembership<'info> {
     )]
     pub margin_group: AccountLoader<'info, MarginGroup>,
     #[account(
-        constraint = market.load()?.is_pending() @ StateError::InvalidStatus
+        constraint = market.load()?.is_pending() @ StateError::InvalidStatus,
+        constraint = market.load()?.can_start(Clock::get()?.unix_timestamp) @ StateError::MarketAlreadyStarted
     )]
     pub market: AccountLoader<'info, MarketState>,
     #[account(
@@ -36,17 +37,7 @@ pub struct ActivateMarketGroupMembership<'info> {
 pub fn handle_activate_market_group_membership(
     context: Context<ActivateMarketGroupMembership>,
 ) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
-
-    let mut group = context.accounts.margin_group.load_mut()?;
-
-    let market = context.accounts.market.load()?;
-
-    if now >= market.config.start_timestamp {
-        return Err(StateError::InvalidStatus.into());
-    }
-
-    group.add_market()?;
+    context.accounts.margin_group.load_mut()?.add_market()?;
 
     Ok(())
 }

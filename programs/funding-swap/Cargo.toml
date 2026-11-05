@@ -33,6 +33,7 @@ pyth-solana-receiver-sdk = "2.0.0"
 
 [dev-dependencies]
 anyhow = "1"
+base64 = "0.22"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 litesvm = "0.12"
 proptest = "1"

@@ -1316,7 +1316,6 @@ impl MarketState {
         maximum_order_size_atoms: u64,
         maximum_open_orders_per_subaccount: u8,
     ) -> StateResult<()> {
-
         if now < 0 {
             return Err(StateError::InvalidClock);
         }

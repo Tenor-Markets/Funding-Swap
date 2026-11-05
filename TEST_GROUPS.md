@@ -30,6 +30,7 @@ the next.
 - `update_fees_and_liquidation.rs`
 - `restrict_market_status.rs`
 - `restore_market_status.rs`
+- `seed_market_source.rs`
 
 ## Group 4 — Administration: vault
 
@@ -71,6 +72,5 @@ the next.
 - `settle_all_markets_into_collateral.rs`
 - `settle_matured_markets.rs`
 - `refresh_market.rs`
-- `seed_market_source.rs`
 - `finalize_market.rs`
 - `finalize_markets.rs`
