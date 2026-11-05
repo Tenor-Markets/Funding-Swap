@@ -43,8 +43,7 @@ the next.
 
 - `create_subaccount.rs`
 - `update_delegate.rs`
-- `close_subaccount.rs`
-- `deposit_asset.rs` (don't forget to test withdrawal limits)
+- `deposit_asset.rs` (don't forget to test withdrawal limits effects)
 
 ## Group 6 — Orders
 
@@ -64,6 +63,7 @@ the next.
 - `close_market.rs`
 - `collect_protocol_fees.rs`
 - `purge_expired_order.rs`
+- `close_subaccount.rs`
 - `risky_order_cleanup.rs`
 - `close_only_cleanup.rs`
 - `withdraw_asset.rs` (don't forget to test withdrawal constraints)

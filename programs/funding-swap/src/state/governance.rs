@@ -362,15 +362,30 @@ impl UpdateFeesAndLiquidationArgs {
     }
 }
 
+fn update_durations(
+    current: &mut [u64; 3],
+    target: Option<[u64; 3]>,
+    increase: bool,
+) -> StateResult<()> {
+    if let Some(values) = target {
+        for (current, value) in current.iter_mut().zip(values) {
+            update_directional(current, Some(value), increase)?;
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, Default)]
 pub struct UpdateWithdrawalLimitsArgs {
     pub short_window_limit_atoms: Option<u128>,
     pub medium_window_limit_atoms: Option<u128>,
     pub long_window_limit_atoms: Option<u128>,
+    pub window_durations: Option<[u64; 3]>,
 }
 
 impl UpdateWithdrawalLimitsArgs {
-    pub fn apply(&self, asset: &mut AssetState, tightening: bool) -> StateResult<()> {
+    pub fn apply(&self, asset: &mut AssetState, tightening: bool, now: i64) -> StateResult<()> {
         let mut short = asset.short_window.limit_atoms;
         let mut medium = asset.medium_window.limit_atoms;
         let mut long = asset.long_window.limit_atoms;
@@ -379,8 +394,17 @@ impl UpdateWithdrawalLimitsArgs {
         update_directional(&mut medium, self.medium_window_limit_atoms, !tightening)?;
         update_directional(&mut long, self.long_window_limit_atoms, !tightening)?;
 
-        // Preserve the withdrawal counters; a limit update must not reset usage.
-        asset.set_limits(short, medium, long);
+        let mut durations = [
+            asset.short_window.duration_seconds,
+            asset.medium_window.duration_seconds,
+            asset.long_window.duration_seconds,
+        ];
+
+        // Tightening lengthens the windows; recovery shortens them.
+        update_durations(&mut durations, self.window_durations, tightening)?;
+
+        // Every settings change starts a fresh window for all three durations.
+        asset.apply_withdrawal_settings(short, medium, long, durations, now)?;
 
         Ok(())
     }

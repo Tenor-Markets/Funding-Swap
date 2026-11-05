@@ -20,9 +20,10 @@ pub fn handle_raise_withdrawal_limits(
     context: Context<RaiseWithdrawalLimits>,
     args: UpdateWithdrawalLimitsArgs,
 ) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let mut resource = context.accounts.asset.load_mut()?;
 
-    args.apply(&mut resource, false)?;
+    args.apply(&mut resource, false, now)?;
 
     Ok(())
 }

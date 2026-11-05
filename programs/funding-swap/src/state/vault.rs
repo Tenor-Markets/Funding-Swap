@@ -12,7 +12,9 @@ pub const ASSET_ACTIVE: u8 = 1;
 #[cfg_attr(feature = "idl-build", derive(AnchorSerialize, AnchorDeserialize))]
 pub struct WithdrawalWindow {
     pub limit_atoms: u128,
-    pub withdrawn_atoms: u128,
+    /// Signed net outflow for the current epoch: withdrawals minus deposits.
+    /// It may go negative when deposits exceed withdrawals.
+    pub withdrawn_atoms: i128,
     pub epoch: u64,
     pub duration_seconds: u64,
 }
@@ -21,8 +23,12 @@ fn valid_window_durations(durations: [u64; 3]) -> bool {
     durations[0] > 0 && durations[0] < durations[1] && durations[1] < durations[2]
 }
 
+fn valid_window_limits(limits: [u128; 3]) -> bool {
+    limits[0] < limits[1] && limits[1] < limits[2]
+}
+
 impl WithdrawalWindow {
-    fn check_and_update(&mut self, amount: u128, now: i64) -> StateResult<()> {
+    fn current_epoch(&self, now: i64) -> StateResult<u64> {
         if now < 0 {
             return Err(StateError::InvalidClock);
         }
@@ -30,8 +36,11 @@ impl WithdrawalWindow {
             return Err(StateError::InvalidWithdrawalWindowDurations);
         }
 
-        let epoch =
-            u64::try_from(now).map_err(|_| StateError::InvalidClock)? / self.duration_seconds;
+        Ok(u64::try_from(now).map_err(|_| StateError::InvalidClock)? / self.duration_seconds)
+    }
+
+    fn check_and_update(&mut self, amount: u128, now: i64) -> StateResult<()> {
+        let epoch = self.current_epoch(now)?;
 
         let withdrawn = if self.epoch == epoch {
             self.withdrawn_atoms
@@ -39,16 +48,50 @@ impl WithdrawalWindow {
             0
         };
 
+        let amount = i128::try_from(amount).map_err(|_| StateError::ArithmeticOverflow)?;
+
         let next = withdrawn
             .checked_add(amount)
             .ok_or(StateError::ArithmeticOverflow)?;
 
-        if next > self.limit_atoms {
+        let limit = i128::try_from(self.limit_atoms).unwrap_or(i128::MAX);
+
+        if next > limit {
             return Err(StateError::WithdrawalLimitExceeded);
         }
 
         self.epoch = epoch;
         self.withdrawn_atoms = next;
+
+        Ok(())
+    }
+
+    /// Cancels previously withdrawn atoms in the current epoch and allows the
+    /// balance to go negative when deposits exceed withdrawals.
+    fn check_and_update_deposit(&mut self, amount: u128, now: i64) -> StateResult<()> {
+        let epoch = self.current_epoch(now)?;
+
+        let withdrawn = if self.epoch == epoch {
+            self.withdrawn_atoms
+        } else {
+            0
+        };
+
+        let amount = i128::try_from(amount).map_err(|_| StateError::ArithmeticOverflow)?;
+
+        let next = withdrawn
+            .checked_sub(amount)
+            .ok_or(StateError::ArithmeticOverflow)?;
+
+        self.epoch = epoch;
+        self.withdrawn_atoms = next;
+
+        Ok(())
+    }
+
+    fn reset(&mut self, now: i64) -> StateResult<()> {
+        self.epoch = self.current_epoch(now)?;
+        self.withdrawn_atoms = 0;
 
         Ok(())
     }
@@ -116,6 +159,13 @@ impl AssetState {
         if !valid_window_durations(window_durations) {
             return Err(StateError::InvalidWithdrawalWindowDurations);
         }
+        if !valid_window_limits([
+            short_window_limit_atoms,
+            medium_window_limit_atoms,
+            long_window_limit_atoms,
+        ]) {
+            return Err(StateError::InvalidWithdrawalLimits);
+        }
         *self = Self {
             bump,
             status: ASSET_PENDING,
@@ -176,10 +226,36 @@ impl AssetState {
         self.token_account == token_account
     }
 
-    pub fn set_limits(&mut self, short: u128, medium: u128, long: u128) {
-        self.short_window.limit_atoms = short;
-        self.medium_window.limit_atoms = medium;
-        self.long_window.limit_atoms = long;
+    /// Applies new limits and durations atomically, validates the duration
+    /// ordering, and resets every window's net outflow.
+    pub fn apply_withdrawal_settings(
+        &mut self,
+        short_limit_atoms: u128,
+        medium_limit_atoms: u128,
+        long_limit_atoms: u128,
+        window_durations: [u64; 3],
+        now: i64,
+    ) -> StateResult<()> {
+        if !valid_window_durations(window_durations) {
+            return Err(StateError::InvalidWithdrawalWindowDurations);
+        }
+        if !valid_window_limits([short_limit_atoms, medium_limit_atoms, long_limit_atoms]) {
+            return Err(StateError::InvalidWithdrawalLimits);
+        }
+
+        self.short_window.limit_atoms = short_limit_atoms;
+        self.medium_window.limit_atoms = medium_limit_atoms;
+        self.long_window.limit_atoms = long_limit_atoms;
+
+        self.short_window.duration_seconds = window_durations[0];
+        self.medium_window.duration_seconds = window_durations[1];
+        self.long_window.duration_seconds = window_durations[2];
+
+        self.short_window.reset(now)?;
+        self.medium_window.reset(now)?;
+        self.long_window.reset(now)?;
+
+        Ok(())
     }
 
     /// Updates all withdrawal windows in sequence. Callers must propagate an
@@ -189,6 +265,15 @@ impl AssetState {
         self.short_window.check_and_update(amount, now)?;
         self.medium_window.check_and_update(amount, now)?;
         self.long_window.check_and_update(amount, now)?;
+        Ok(())
+    }
+
+    /// Cancels previously withdrawn atoms in each window's current epoch,
+    /// floored at zero. Deposits do not create additional withdrawal capacity.
+    pub fn check_and_commit_deposit(&mut self, amount: u128, now: i64) -> StateResult<()> {
+        self.short_window.check_and_update_deposit(amount, now)?;
+        self.medium_window.check_and_update_deposit(amount, now)?;
+        self.long_window.check_and_update_deposit(amount, now)?;
         Ok(())
     }
 }

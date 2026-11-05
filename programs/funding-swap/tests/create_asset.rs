@@ -37,7 +37,7 @@ fn test_create_asset_validates_oracle_and_window_config() {
 
     type Mutator = fn(&mut CreateAssetArgs);
 
-    let cases: [(&str, Mutator, StateError); 9] = [
+    let cases: [(&str, Mutator, StateError); 12] = [
         (
             "zero oracle max age",
             |args| args.max_age_seconds = 0,
@@ -82,6 +82,30 @@ fn test_create_asset_validates_oracle_and_window_config() {
             "decreasing windows",
             |args| args.window_durations = [86_400, 3_600, 604_800],
             StateError::InvalidWithdrawalWindowDurations,
+        ),
+        (
+            "equal short and medium limits",
+            |args| {
+                args.short_window_limit_atoms = 1_000_000;
+                args.medium_window_limit_atoms = 1_000_000;
+            },
+            StateError::InvalidWithdrawalLimits,
+        ),
+        (
+            "equal medium and long limits",
+            |args| {
+                args.medium_window_limit_atoms = 100_000_000;
+                args.long_window_limit_atoms = 100_000_000;
+            },
+            StateError::InvalidWithdrawalLimits,
+        ),
+        (
+            "decreasing limits",
+            |args| {
+                args.short_window_limit_atoms = 10_000_000;
+                args.medium_window_limit_atoms = 1_000_000;
+            },
+            StateError::InvalidWithdrawalLimits,
         ),
     ];
 

@@ -20,9 +20,10 @@ pub fn handle_tighten_withdrawal_limits(
     context: Context<TightenWithdrawalLimits>,
     args: UpdateWithdrawalLimitsArgs,
 ) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let mut resource = context.accounts.asset.load_mut()?;
 
-    args.apply(&mut resource, true)?;
+    args.apply(&mut resource, true, now)?;
 
     Ok(())
 }

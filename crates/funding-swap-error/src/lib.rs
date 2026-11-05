@@ -333,4 +333,6 @@ pub enum FundingSwapError {
     OrderNotExpired,
     #[msg("The order has expired and can no longer be modified.")]
     OrderExpired,
+    #[msg("Withdrawal limits must be strictly increasing from short to medium to long.")]
+    InvalidWithdrawalLimits,
 }

@@ -5,10 +5,11 @@ use solana_sdk::signer::Signer;
 
 mod common;
 use common::{
-    airdrop_keypair, assert_account_not_signer, assert_asset_withdrawal_limits,
-    assert_instruction_error, assert_transaction_success, create_asset, create_asset_args, new_svm,
+    airdrop_keypair, assert_account_not_signer, assert_asset_window_durations,
+    assert_asset_window_withdrawn, assert_asset_withdrawal_limits, assert_instruction_error,
+    assert_transaction_success, create_asset, create_asset_args, new_svm,
     raise_withdrawal_limits_instruction, read_asset_state, send_tx, send_without_signer,
-    setup_active_asset, setup_governance,
+    set_asset_withdrawn_atoms, setup_active_asset, setup_governance,
 };
 
 #[test]
@@ -36,6 +37,14 @@ fn test_raise_withdrawal_limits_updates_limits_and_rejects_wrong_direction() {
             long_window_limit_atoms: Some(before.long_window.limit_atoms / 2),
             ..UpdateWithdrawalLimitsArgs::default()
         },
+        UpdateWithdrawalLimitsArgs {
+            window_durations: Some([
+                before.short_window.duration_seconds * 2,
+                before.medium_window.duration_seconds * 2,
+                before.long_window.duration_seconds * 2,
+            ]),
+            ..UpdateWithdrawalLimitsArgs::default()
+        },
     ];
 
     for args in wrong_direction_cases {
@@ -48,14 +57,36 @@ fn test_raise_withdrawal_limits_updates_limits_and_rejects_wrong_direction() {
         );
     }
 
+    let invalid_ordering = UpdateWithdrawalLimitsArgs {
+        short_window_limit_atoms: Some(before.medium_window.limit_atoms * 2),
+        ..UpdateWithdrawalLimitsArgs::default()
+    };
+    let ix = raise_withdrawal_limits_instruction(authority.pubkey(), asset, invalid_ordering);
+
+    assert_instruction_error(
+        send_tx(&mut svm, authority, vec![ix], &[]),
+        0,
+        u32::from(StateError::InvalidWithdrawalLimits),
+    );
+
+    set_asset_withdrawn_atoms(&mut svm, asset, 123, 123, 123).expect("set withdrawn atoms");
+
     let short_limit_atoms = before.short_window.limit_atoms * 2;
     let medium_limit_atoms = before.medium_window.limit_atoms * 2;
     let long_limit_atoms = before.long_window.limit_atoms * 2;
+    let short_duration_seconds = before.short_window.duration_seconds / 2;
+    let medium_duration_seconds = before.medium_window.duration_seconds / 2;
+    let long_duration_seconds = before.long_window.duration_seconds / 2;
 
     let args = UpdateWithdrawalLimitsArgs {
         short_window_limit_atoms: Some(short_limit_atoms),
         medium_window_limit_atoms: Some(medium_limit_atoms),
         long_window_limit_atoms: Some(long_limit_atoms),
+        window_durations: Some([
+            short_duration_seconds,
+            medium_duration_seconds,
+            long_duration_seconds,
+        ]),
     };
 
     let ix = raise_withdrawal_limits_instruction(authority.pubkey(), asset, args);
@@ -69,6 +100,14 @@ fn test_raise_withdrawal_limits_updates_limits_and_rejects_wrong_direction() {
         medium_limit_atoms,
         long_limit_atoms,
     );
+    assert_asset_window_durations(
+        &svm,
+        asset,
+        short_duration_seconds,
+        medium_duration_seconds,
+        long_duration_seconds,
+    );
+    assert_asset_window_withdrawn(&svm, asset, 0, 0, 0);
 }
 
 #[test]

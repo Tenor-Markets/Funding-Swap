@@ -22,6 +22,7 @@ pub struct DepositAsset<'info> {
     pub token_vault: Account<'info, TokenAccount>,
     #[account(
         seeds = [crate::state::USDC_SEED], bump = asset.load()?.bump,
+        mut,
         constraint = asset.load()?.is_active() @ StateError::InvalidStatus,
         constraint = asset.load()?.is_valid_custody(token_vault.key()) @ StateError::InvalidTargetCustody
     )]
@@ -41,6 +42,14 @@ pub struct DepositAsset<'info> {
 /// selected beneficiary.
 pub fn handle_deposit_asset(context: Context<DepositAsset>, amount: u64) -> Result<()> {
     if amount != 0 {
+        let now = Clock::get()?.unix_timestamp;
+
+        context
+            .accounts
+            .asset
+            .load_mut()?
+            .check_and_commit_deposit(u128::from(amount), now)?;
+
         context
             .accounts
             .beneficiary

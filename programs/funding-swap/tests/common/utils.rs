@@ -7,18 +7,22 @@ use std::path::Path;
 use anchor_lang::solana_program::program_option::COption;
 use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{system_program, InstructionData};
-use anchor_spl::token::spl_token::state::{Account as SplTokenAccount, AccountState};
+use anchor_spl::token::spl_token::state::{
+    Account as SplTokenAccount, AccountState, Mint as SplMint,
+};
 use anyhow::{anyhow, Context, Result};
 use fixed::types::I64F64;
-pub use funding_swap::state::{usdc_asset_address, ASSET_PENDING, USDC_MINT, USDC_USD_FEED_ID};
+pub use funding_swap::state::{
+    usdc_asset_address, ASSET_PENDING, USDC_DECIMALS, USDC_MINT, USDC_USD_FEED_ID,
+};
 use funding_swap::{
     instruction,
     state::market::MARKET_U128_PADDING,
     state::{
         AssetState, AuthorityUpdate, FixedPoint, GlobalGovernanceConfig, GovernanceCategory,
-        MarginGroup, MarketConfig, MarketState, UpdateFeesAndLiquidationArgs, UpdateGroupRiskArgs,
-        UpdateMarketRiskArgs, UpdateWithdrawalLimitsArgs, GOVERNANCE_CATEGORIES, GROUP_PENDING,
-        MARKET_PENDING,
+        MarginGroup, MarketConfig, MarketState, Subaccount, UpdateFeesAndLiquidationArgs,
+        UpdateGroupRiskArgs, UpdateMarketRiskArgs, UpdateWithdrawalLimitsArgs,
+        GOVERNANCE_CATEGORIES, GROUP_PENDING, MARKET_PENDING, SUBACCOUNT_ACTIVE,
     },
     CreateAssetArgs, CreateMarginGroupArgs, CreateMarketArgs, GovernanceInitializationArgs,
     MarketAdapterArgs, ID as FUNDING_SWAP_PROGRAM_ID,
@@ -1332,10 +1336,40 @@ fn option_to_coption<T>(option: Option<T>) -> COption<T> {
     option.map_or(COption::None, COption::Some)
 }
 
-pub fn create_token_account_for_mint(
+pub fn set_usdc_mint_account(svm: &mut LiteSVM) -> Result<()> {
+    let mint = SplMint {
+        mint_authority: COption::None,
+        supply: 1_000_000_000_000,
+        decimals: USDC_DECIMALS,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    };
+
+    let mut data = vec![0u8; SplMint::LEN];
+    SplMint::pack(mint, &mut data).context("pack USDC mint")?;
+
+    let lamports = svm.minimum_balance_for_rent_exemption(data.len());
+
+    svm.set_account(
+        USDC_MINT,
+        Account {
+            lamports,
+            data,
+            owner: anchor_spl::token::spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .context("set USDC mint account")?;
+
+    Ok(())
+}
+
+pub fn create_token_account_for_mint_with_amount(
     svm: &mut LiteSVM,
     mint: Pubkey,
     owner: Pubkey,
+    amount: u64,
     delegate: Option<Pubkey>,
     close_authority: Option<Pubkey>,
 ) -> Result<Pubkey> {
@@ -1343,7 +1377,7 @@ pub fn create_token_account_for_mint(
     let token = SplTokenAccount {
         mint,
         owner,
-        amount: 0,
+        amount,
         delegate: option_to_coption(delegate),
         state: AccountState::Initialized,
         is_native: COption::None,
@@ -1371,8 +1405,36 @@ pub fn create_token_account_for_mint(
     Ok(key)
 }
 
+pub fn create_token_account_for_mint(
+    svm: &mut LiteSVM,
+    mint: Pubkey,
+    owner: Pubkey,
+    delegate: Option<Pubkey>,
+    close_authority: Option<Pubkey>,
+) -> Result<Pubkey> {
+    create_token_account_for_mint_with_amount(svm, mint, owner, 0, delegate, close_authority)
+}
+
+pub fn create_funded_token_account(
+    svm: &mut LiteSVM,
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) -> Result<Pubkey> {
+    create_token_account_for_mint_with_amount(svm, mint, owner, amount, None, None)
+}
+
 pub fn create_usdc_token_account(svm: &mut LiteSVM, owner: Pubkey) -> Result<Pubkey> {
     create_token_account_for_mint(svm, USDC_MINT, owner, None, None)
+}
+
+pub fn assert_token_account_amount(svm: &LiteSVM, token_account: Pubkey, expected_amount: u64) {
+    let account = svm
+        .get_account(&token_account)
+        .expect("token account not found");
+    let token = SplTokenAccount::unpack(&account.data).expect("unpack token account");
+
+    assert_eq!(token.amount, expected_amount);
 }
 
 pub fn create_asset_instruction(
@@ -1405,17 +1467,25 @@ pub fn send_create_asset(
     send_tx(svm, authority, vec![ix], &[])
 }
 
-pub fn create_asset(
+pub fn create_asset_with_token_account(
     svm: &mut LiteSVM,
     setup: &GovernanceSetup,
     args: CreateAssetArgs,
-) -> Result<Pubkey> {
+) -> Result<(Pubkey, Pubkey)> {
     let asset = usdc_asset_address();
     let token_account = create_usdc_token_account(svm, asset)?;
 
     assert_transaction_success(send_create_asset(svm, setup, token_account, args));
 
-    Ok(asset)
+    Ok((asset, token_account))
+}
+
+pub fn create_asset(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    args: CreateAssetArgs,
+) -> Result<Pubkey> {
+    Ok(create_asset_with_token_account(svm, setup, args)?.0)
 }
 
 pub fn activate_asset_instruction(authority: Pubkey, asset: Pubkey) -> Instruction {
@@ -1439,16 +1509,248 @@ pub fn activate_asset(svm: &mut LiteSVM, setup: &GovernanceSetup, asset: Pubkey)
     Ok(())
 }
 
+pub fn setup_active_asset_with_custody(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+) -> Result<(Pubkey, Pubkey, CreateAssetArgs)> {
+    let args = create_asset_args();
+    let (asset, token_account) = create_asset_with_token_account(svm, setup, args)?;
+
+    activate_asset(svm, setup, asset)?;
+
+    Ok((asset, token_account, args))
+}
+
 pub fn setup_active_asset(
     svm: &mut LiteSVM,
     setup: &GovernanceSetup,
 ) -> Result<(Pubkey, CreateAssetArgs)> {
-    let args = create_asset_args();
-    let asset = create_asset(svm, setup, args)?;
-
-    activate_asset(svm, setup, asset)?;
+    let (asset, _token_account, args) = setup_active_asset_with_custody(svm, setup)?;
 
     Ok((asset, args))
+}
+
+pub fn set_subaccount_creation_fee(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    fee_lamports: u64,
+    destination: Pubkey,
+) -> Result<()> {
+    let authority = setup.authority(GovernanceCategory::AuthorityAdministration);
+    let args = funding_swap::state::UpdateAuthoritiesArgs {
+        authority_update: None,
+        subaccount_creation_fee_lamports: Some(fee_lamports),
+        subaccount_creation_fee_destination: Some(destination),
+    };
+    let ix = update_authorities_instruction(authority.pubkey(), args);
+
+    assert_transaction_success(send_tx(svm, authority, vec![ix], &[]));
+
+    Ok(())
+}
+
+pub fn subaccount_address(authority: Pubkey, subaccount_id: u16) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"subaccount",
+            authority.as_ref(),
+            &subaccount_id.to_le_bytes(),
+        ],
+        &FUNDING_SWAP_PROGRAM_ID,
+    )
+    .0
+}
+
+pub fn create_subaccount_instruction(
+    authority: Pubkey,
+    subaccount_id: u16,
+    margin_group: Pubkey,
+    creation_fee_destination: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(authority, true),
+            AccountMeta::new(subaccount_address(authority, subaccount_id), false),
+            AccountMeta::new(margin_group, false),
+            AccountMeta::new_readonly(governance_address(), false),
+            AccountMeta::new(creation_fee_destination, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: instruction::CreateSubaccount { subaccount_id }.data(),
+    }
+}
+
+pub fn create_subaccount(
+    svm: &mut LiteSVM,
+    setup: &GovernanceSetup,
+    authority: &Keypair,
+    subaccount_id: u16,
+    margin_group: Pubkey,
+) -> Result<Pubkey> {
+    let governance = read_governance(svm, setup.governance)?;
+    let ix = create_subaccount_instruction(
+        authority.pubkey(),
+        subaccount_id,
+        margin_group,
+        governance.subaccount_creation_fee_destination,
+    );
+
+    assert_transaction_success(send_tx(svm, authority, vec![ix], &[]));
+
+    Ok(subaccount_address(authority.pubkey(), subaccount_id))
+}
+
+pub fn read_subaccount(svm: &LiteSVM, subaccount: Pubkey) -> Result<Subaccount> {
+    let account = svm
+        .get_account(&subaccount)
+        .ok_or_else(|| anyhow!("subaccount account not found"))?;
+
+    let data = account
+        .data
+        .get(8..)
+        .ok_or_else(|| anyhow!("subaccount account is smaller than its discriminator"))?;
+
+    Ok(bytemuck::pod_read_unaligned::<Subaccount>(data))
+}
+
+pub fn assert_subaccount_created(
+    svm: &LiteSVM,
+    subaccount: Pubkey,
+    authority: Pubkey,
+    subaccount_id: u16,
+    group_id: u16,
+) {
+    let state = read_subaccount(svm, subaccount).expect("read subaccount");
+
+    assert_eq!(state.authority, authority);
+    assert_eq!(state.subaccount_id, subaccount_id);
+    assert_eq!(state.group_id, group_id);
+    assert_eq!(state.status.0, SUBACCOUNT_ACTIVE);
+    assert_eq!(state.collateral_balance_atoms, 0);
+    assert_eq!(state.delegate, Pubkey::default());
+}
+
+pub fn assert_subaccount_delegate(svm: &LiteSVM, subaccount: Pubkey, expected_delegate: Pubkey) {
+    assert_eq!(
+        read_subaccount(svm, subaccount)
+            .expect("read subaccount")
+            .delegate,
+        expected_delegate
+    );
+}
+
+pub fn assert_subaccount_collateral(
+    svm: &LiteSVM,
+    subaccount: Pubkey,
+    expected_collateral_atoms: i128,
+) {
+    assert_eq!(
+        read_subaccount(svm, subaccount)
+            .expect("read subaccount")
+            .collateral_balance_atoms,
+        expected_collateral_atoms
+    );
+}
+
+pub fn update_delegate_instruction(
+    authority: Pubkey,
+    subaccount: Pubkey,
+    delegate: Pubkey,
+    margin_group: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(authority, true),
+            AccountMeta::new(subaccount, false),
+            AccountMeta::new_readonly(margin_group, false),
+        ],
+        data: instruction::UpdateDelegate { delegate }.data(),
+    }
+}
+
+pub fn deposit_asset_instruction(
+    depositor: Pubkey,
+    source: Pubkey,
+    token_vault: Pubkey,
+    margin_group: Pubkey,
+    beneficiary: Pubkey,
+    amount: u64,
+) -> Instruction {
+    Instruction {
+        program_id: FUNDING_SWAP_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(depositor, true),
+            AccountMeta::new(source, false),
+            AccountMeta::new_readonly(USDC_MINT, false),
+            AccountMeta::new(token_vault, false),
+            AccountMeta::new(usdc_asset_address(), false),
+            AccountMeta::new_readonly(margin_group, false),
+            AccountMeta::new(beneficiary, false),
+            AccountMeta::new_readonly(anchor_spl::token::spl_token::ID, false),
+        ],
+        data: instruction::DepositAsset { amount }.data(),
+    }
+}
+
+pub fn set_asset_withdrawn_atoms(
+    svm: &mut LiteSVM,
+    asset: Pubkey,
+    short_withdrawn_atoms: i128,
+    medium_withdrawn_atoms: i128,
+    long_withdrawn_atoms: i128,
+) -> Result<()> {
+    let mut state = read_asset_state(svm, asset)?;
+    let mut account = svm
+        .get_account(&asset)
+        .ok_or_else(|| anyhow!("asset account not found"))?;
+
+    state.short_window.withdrawn_atoms = short_withdrawn_atoms;
+    state.medium_window.withdrawn_atoms = medium_withdrawn_atoms;
+    state.long_window.withdrawn_atoms = long_withdrawn_atoms;
+
+    account
+        .data
+        .get_mut(8..)
+        .ok_or_else(|| anyhow!("asset account is smaller than its discriminator"))?
+        .copy_from_slice(bytemuck::bytes_of(&state));
+
+    svm.set_account(asset, account)
+        .context("patch asset withdrawn atoms")?;
+
+    Ok(())
+}
+
+pub fn assert_asset_window_withdrawn(
+    svm: &LiteSVM,
+    asset: Pubkey,
+    short_withdrawn_atoms: i128,
+    medium_withdrawn_atoms: i128,
+    long_withdrawn_atoms: i128,
+) {
+    let state = read_asset_state(svm, asset).expect("read asset state");
+
+    assert_eq!(state.short_window.withdrawn_atoms, short_withdrawn_atoms);
+    assert_eq!(state.medium_window.withdrawn_atoms, medium_withdrawn_atoms);
+    assert_eq!(state.long_window.withdrawn_atoms, long_withdrawn_atoms);
+}
+
+pub fn assert_asset_window_durations(
+    svm: &LiteSVM,
+    asset: Pubkey,
+    short_duration_seconds: u64,
+    medium_duration_seconds: u64,
+    long_duration_seconds: u64,
+) {
+    let state = read_asset_state(svm, asset).expect("read asset state");
+
+    assert_eq!(state.short_window.duration_seconds, short_duration_seconds);
+    assert_eq!(
+        state.medium_window.duration_seconds,
+        medium_duration_seconds
+    );
+    assert_eq!(state.long_window.duration_seconds, long_duration_seconds);
 }
 
 fn withdrawal_limits_instruction(authority: Pubkey, asset: Pubkey, data: Vec<u8>) -> Instruction {
