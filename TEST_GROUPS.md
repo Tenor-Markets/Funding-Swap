@@ -30,13 +30,12 @@ the next.
 - `update_fees_and_liquidation.rs`
 - `restrict_market_status.rs`
 - `restore_market_status.rs`
-- `seed_market_source.rs`
+- `seed_market_source.rs` (don't forget to come back and expand the tests)
 
 ## Group 4 — Administration: vault
 
 - `create_asset.rs`
 - `activate_asset.rs`
-- `collect_protocol_fees.rs`
 - `tighten_withdrawal_limits.rs`
 - `raise_withdrawal_limits.rs`
 
@@ -45,11 +44,7 @@ the next.
 - `create_subaccount.rs`
 - `update_delegate.rs`
 - `close_subaccount.rs`
-- `close_empty_markets.rs`
-- `close_market.rs`
-- `purge_expired_order.rs`
-- `risky_order_cleanup.rs`
-- `close_only_cleanup.rs`
+- `deposit_asset.rs` (don't forget to test withdrawal limits)
 
 ## Group 6 — Orders
 
@@ -65,8 +60,13 @@ the next.
 
 ## Group 8 — Funds, materialization, settlement, and source lifecycle
 
-- `deposit_asset.rs`
-- `withdraw_asset.rs`
+- `close_empty_markets.rs`
+- `close_market.rs`
+- `collect_protocol_fees.rs`
+- `purge_expired_order.rs`
+- `risky_order_cleanup.rs`
+- `close_only_cleanup.rs`
+- `withdraw_asset.rs` (don't forget to test withdrawal constraints)
 - `materialize_subaccount.rs`
 - `settle_market_into_collateral.rs`
 - `settle_all_markets_into_collateral.rs`
